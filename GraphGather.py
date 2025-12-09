@@ -736,7 +736,7 @@ def main():
     parser.add_argument('--list', action='store_true', help='List available clients and user agents')
     parser.add_argument('--username', '-u', help='Username for authentication')
     parser.add_argument('--password', '-p', help='Password for authentication')
-    parser.add_argument('--client', '-c', help='Client name from list')
+    parser.add_argument('--client', '-c', help='Client name from list', default='Microsoft Intune Company Portal')
     parser.add_argument('--user-agent', '-a', help='User agent name from list', default='Windows 10 Chrome')
     parser.add_argument('--resource', '-r', help='Resource URL', default='https://graph.microsoft.com')
     parser.add_argument('--token-file', '-t', help='Parse existing token file')
