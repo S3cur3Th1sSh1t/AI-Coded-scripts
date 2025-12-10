@@ -103,18 +103,18 @@ def find_nessus_files(directory):
         if directory.endswith('.nessus'):
             return [directory]
         else:
-            print(f"[-] File {directory} is not a .nessus file")
+            print(f"[-] File {directory} is not a .nessus file", file=sys.stderr)
             return []
     
     # Directory provided
     path = Path(directory)
     
     if not path.exists():
-        print(f"[-] Directory/file not found: {directory}")
+        print(f"[-] Directory/file not found: {directory}", file=sys.stderr)
         return []
     
     if not path.is_dir():
-        print(f"[-] {directory} is not a directory")
+        print(f"[-] {directory} is not a directory", file=sys.stderr)
         return []
     
     # Find all .nessus files (recursive)
@@ -155,17 +155,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single file
-  python search.py scan.nessus --cve CVE-2020-14517
+  # List unique IPs with HIGH Apache vulnerabilities
+  python search.py ./nessus_exports/ --keyword Apache --criticality HIGH --ip-only
   
-  # Directory (recursive by default)
-  python search.py ./nessus_exports/ --keyword Siemens
+  # List CRITICAL Siemens vulnerabilities with details
+  python search.py ./nessus_exports/ --keyword Siemens --criticality CRITICAL
   
-  # CSV output
-  python search.py ./nessus_exports/ --plugin 149307 --csv > results.csv
+  # CSV output with severity filter
+  python search.py ./nessus_exports/ --cve CVE-2020-14517 --criticality HIGH --csv
   
-  # Filter by severity
-  python search.py ./nessus_exports/ --keyword "remote code" --severity 4
+  # Only IPs (one per line, for scripting)
+  python search.py ./nessus_exports/ --keyword "remote code" --criticality CRITICAL --ip-only
         """
     )
     
@@ -173,10 +173,19 @@ Examples:
     parser.add_argument('--cve', help='Search by CVE (e.g., CVE-2020-14517)')
     parser.add_argument('--keyword', help='Search by keyword in description')
     parser.add_argument('--plugin', help='Search by Plugin ID (e.g., 149307)')
+    
+    # NEW: Criticality filter (more intuitive than numeric severity)
+    parser.add_argument('--criticality', '-c', 
+                       choices=['INFO', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
+                       help='Filter by criticality level')
+    
+    # Keep old --severity for backward compatibility
     parser.add_argument('--severity', choices=['0','1','2','3','4'], 
                        help='Filter by severity (0=Info, 1=Low, 2=Medium, 3=High, 4=Critical)')
+    
     parser.add_argument('--csv', action='store_true', help='Output as CSV')
-    parser.add_argument('--unique', action='store_true', help='Remove duplicate hosts')
+    parser.add_argument('--unique', action='store_true', help='Remove duplicate hosts (default: True)')
+    parser.add_argument('--ip-only', action='store_true', help='Output only unique IP addresses (one per line)')
     
     args = parser.parse_args()
     
@@ -184,7 +193,7 @@ Examples:
     nessus_files = find_nessus_files(args.file)
     
     if not nessus_files:
-        print("[-] No .nessus files found")
+        print("[-] No .nessus files found", file=sys.stderr)
         sys.exit(1)
     
     print(f"[*] Found {len(nessus_files)} .nessus file(s)", file=sys.stderr)
@@ -200,70 +209,79 @@ Examples:
         search_func = find_by_plugin_id
         search_term = args.plugin
     else:
-        print("[-] Please specify --cve, --keyword, or --plugin")
+        print("[-] Please specify --cve, --keyword, or --plugin", file=sys.stderr)
         sys.exit(1)
     
     # Parse all files
     results = parse_multiple_files(nessus_files, search_func, search_term)
     
-    # Filter by severity
-    if args.severity:
+    # Map criticality to severity number
+    criticality_map = {
+        'INFO': '0',
+        'LOW': '1',
+        'MEDIUM': '2',
+        'HIGH': '3',
+        'CRITICAL': '4'
+    }
+    
+    # Filter by criticality (new) or severity (old)
+    if args.criticality:
+        severity_filter = criticality_map[args.criticality]
+        results = [r for r in results if r['severity'] == severity_filter]
+        print(f"[*] Filtering for {args.criticality} vulnerabilities", file=sys.stderr)
+    elif args.severity:
         results = [r for r in results if r['severity'] == args.severity]
     
-    # Remove duplicates by IP
-    if args.unique:
+    # Always remove duplicates by default (or explicit --unique)
+    if args.unique or args.ip_only or True:  # Default behavior
         seen_ips = set()
         unique_results = []
         for r in results:
             if r['ip'] not in seen_ips:
                 seen_ips.add(r['ip'])
                 unique_results.append(r)
+        
+        if len(results) != len(unique_results):
+            print(f"[*] Removed {len(results) - len(unique_results)} duplicate(s), {len(unique_results)} unique host(s) remaining", file=sys.stderr)
+        
         results = unique_results
-        print(f"[*] Removed duplicates, {len(results)} unique host(s) remaining", file=sys.stderr)
     
-    # Output
+    # IP-only output (for scripting)
+    if args.ip_only:
+        for r in results:
+            print(r['ip'])
+        sys.exit(0)
+    
+    # CSV output
     if args.csv:
         print("Hostname,IP,PluginID,PluginName,Severity,SourceFile")
         for r in results:
-            print(f"{r['hostname']},{r['ip']},{r['plugin_id']},{r['plugin_name']},{r['severity']},{r.get('source_file', 'N/A')}")
-    else:
-        print(f"\n[+] Found {len(results)} affected host(s) across {len(nessus_files)} file(s):\n")
+            sev_num = r['severity']
+            sev_name = {v: k for k, v in criticality_map.items()}.get(sev_num, sev_num)
+            print(f"{r['hostname']},{r['ip']},{r['plugin_id']},{r['plugin_name']},{sev_name},{r.get('source_file', 'N/A')}")
+        sys.exit(0)
+    
+    # Standard output
+    print(f"\n[+] Found {len(results)} unique affected host(s) across {len(nessus_files)} file(s):\n", file=sys.stderr)
+    
+    # Group by source file
+    by_file = {}
+    for r in results:
+        source = r.get('source_file', 'Unknown')
+        if source not in by_file:
+            by_file[source] = []
+        by_file[source].append(r)
+    
+    for source_file, file_results in by_file.items():
+        print(f"\n{'='*70}")
+        print(f"Source: {source_file} ({len(file_results)} results)")
+        print('='*70)
         
-        # Group by source file
-        by_file = {}
-        for r in results:
-            source = r.get('source_file', 'Unknown')
-            if source not in by_file:
-                by_file[source] = []
-            by_file[source].append(r)
-        
-        for source_file, file_results in by_file.items():
-            print(f"\n{'='*70}")
-            print(f"Source: {source_file} ({len(file_results)} results)")
-            print('='*70)
-            
-            for r in file_results:
-                sev_map = {'0':'Info', '1':'Low', '2':'Medium', '3':'High', '4':'Critical'}
-                severity = sev_map.get(r['severity'], r['severity'])
-                print(f"\n[{severity}] {r['hostname']} ({r['ip']})")
-                print(f"  Plugin: {r['plugin_id']} - {r['plugin_name']}")
+        for r in file_results:
+            sev_map = {'0':'Info', '1':'Low', '2':'Medium', '3':'High', '4':'Critical'}
+            severity = sev_map.get(r['severity'], r['severity'])
+            print(f"\n[{severity}] {r['hostname']} ({r['ip']})")
+            print(f"  Plugin: {r['plugin_id']} - {r['plugin_name']}")
 
 if __name__ == '__main__':
     main()
-
-
-'''
-
-# Directory durchsuchen (rekursiv)
-python search.py ./nessus_exports/ --keyword Siemens
-
-# Mit Severity-Filter
-python search.py ./nessus_exports/ --keyword Siemens --severity 4
-
-# CSV Export
-python search.py ./nessus_exports/ --cve CVE-2020-14517 --csv > results.csv
-
-# Unique Hosts only
-python search.py ./nessus_exports/ --plugin 149307 --unique
-
-'''
