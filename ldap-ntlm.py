@@ -14,7 +14,7 @@ When using ntlmrelayx with SOCKS5 proxying for LDAP sessions, most tools fail:
 - ldapdomaindump → Invalid messageId / socket receive errors
 - NetExec/CrackMapExec → Index out of range errors
 - Standard ldap3 scripts → Session terminated by server
-- bloodhound-python → Cannot work via ntlmrelayx SOCKS
+- bloodhound-python → did not work with an IP as domaincontroller target
 
 ROOT CAUSE:
 ntlmrelayx's SOCKS5 LDAP proxy has limitations:
