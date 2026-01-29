@@ -14,7 +14,7 @@ When using ntlmrelayx with SOCKS5 proxying for LDAP sessions, most tools fail:
 - ldapdomaindump → Invalid messageId / socket receive errors
 - NetExec/CrackMapExec → Index out of range errors
 - Standard ldap3 scripts → Session terminated by server
-- bloodhound-python → Could not authenticate to DC by IP only by hostname, (might work?)
+- bloodhound-python → Cannot work via ntlmrelayx SOCKS
 
 ROOT CAUSE:
 ntlmrelayx's SOCKS5 LDAP proxy has limitations:
@@ -151,7 +151,7 @@ def safe_json_dump(data, file_obj, **kwargs):
     Safely dump data to JSON, converting any bytes to base64 strings
     """
     sanitized_data = sanitize_for_json(data)
-    safe_json_dump(sanitized_data, file_obj, **kwargs)
+    json.dump(sanitized_data, file_obj, **kwargs)  # Use json.dump, not safe_json_dump!
 
 # BloodHound Legacy trust value mappings
 TRUST_DIRECTION_MAP = {
@@ -291,76 +291,88 @@ def get_users(conn, base_dn):
             generator=True
         )
         
+        processed = 0
         for entry in entries:
-            if entry['type'] != 'searchResEntry':
+            try:
+                if entry['type'] != 'searchResEntry':
+                    continue
+                
+                attrs = entry.get('attributes', {})
+                user = {}
+                
+                # Basic attributes
+                for key in ['sAMAccountName', 'userPrincipalName', 'distinguishedName', 
+                           'description', 'displayName', 'mail', 'title', 'objectSid']:
+                    if key in attrs:
+                        val = attrs[key]
+                        user[key] = val[0] if isinstance(val, list) and val else val
+                
+                # Group memberships
+                if 'memberOf' in attrs:
+                    user['memberOf'] = attrs['memberOf'] if isinstance(attrs['memberOf'], list) else [attrs['memberOf']]
+                
+                # User Account Control
+                if 'userAccountControl' in attrs:
+                    uac = attrs['userAccountControl']
+                    if isinstance(uac, list):
+                        uac = uac[0] if uac else 0
+                    try:
+                        uac = int(uac)
+                    except (ValueError, TypeError):
+                        uac = 0
+                    user['userAccountControl'] = uac
+                    user['enabled'] = not bool(uac & 0x0002)  # ACCOUNTDISABLE
+                    user['trustedToAuth'] = bool(uac & 0x1000000)  # TRUSTED_TO_AUTH_FOR_DELEGATION
+                    user['passwordNotRequired'] = bool(uac & 0x0020)  # PASSWD_NOTREQD
+                    user['dontRequirePreauth'] = bool(uac & 0x400000)  # DONT_REQ_PREAUTH
+                
+                # Privileged user markers
+                if 'adminCount' in attrs:
+                    user['adminCount'] = attrs['adminCount'][0] if isinstance(attrs['adminCount'], list) else attrs['adminCount']
+                
+                # Kerberos delegation
+                if 'servicePrincipalName' in attrs:
+                    spns = attrs['servicePrincipalName']
+                    user['servicePrincipalName'] = spns if isinstance(spns, list) else [spns]
+                
+                if 'msDS-AllowedToDelegateTo' in attrs:
+                    delegates = attrs['msDS-AllowedToDelegateTo']
+                    user['allowedToDelegateTo'] = delegates if isinstance(delegates, list) else [delegates]
+                
+                # RBCD
+                if 'msDS-AllowedToActOnBehalfOfOtherIdentity' in attrs:
+                    user['allowedToActOnBehalfOfOtherIdentity'] = True
+                
+                # Primary group
+                if 'primaryGroupID' in attrs:
+                    user['primaryGroupID'] = attrs['primaryGroupID'][0] if isinstance(attrs['primaryGroupID'], list) else attrs['primaryGroupID']
+                
+                # SID History (privilege escalation vector)
+                if 'sIDHistory' in attrs:
+                    history = attrs['sIDHistory']
+                    user['sIDHistory'] = history if isinstance(history, list) else [history]
+                
+                # Security descriptor for ACLs (convert to base64 for storage)
+                if 'nTSecurityDescriptor' in attrs:
+                    sd = attrs['nTSecurityDescriptor']
+                    if sd:
+                        if isinstance(sd, bytes):
+                            user['nTSecurityDescriptor'] = base64.b64encode(sd).decode('utf-8')
+                        elif isinstance(sd, list) and sd:
+                            user['nTSecurityDescriptor'] = base64.b64encode(sd[0]).decode('utf-8')
+                
+                users.append(user)
+                processed += 1
+                if processed % 1000 == 0:
+                    print(f"    ... processed {processed} users", file=sys.stderr)
+            
+            except (KeyError, ValueError, TypeError) as e:
+                # Skip corrupted entries from SOCKS proxy
+                print(f"[!] Warning: Skipping corrupted entry: {e}", file=sys.stderr)
                 continue
-            
-            attrs = entry.get('attributes', {})
-            user = {}
-            
-            # Basic attributes
-            for key in ['sAMAccountName', 'userPrincipalName', 'distinguishedName', 
-                       'description', 'displayName', 'mail', 'title', 'objectSid']:
-                if key in attrs:
-                    val = attrs[key]
-                    user[key] = val[0] if isinstance(val, list) and val else val
-            
-            # Group memberships
-            if 'memberOf' in attrs:
-                user['memberOf'] = attrs['memberOf'] if isinstance(attrs['memberOf'], list) else [attrs['memberOf']]
-            
-            # User Account Control
-            if 'userAccountControl' in attrs:
-                uac = attrs['userAccountControl']
-                if isinstance(uac, list):
-                    uac = uac[0] if uac else 0
-                try:
-                    uac = int(uac)
-                except (ValueError, TypeError):
-                    uac = 0
-                user['userAccountControl'] = uac
-                user['enabled'] = not bool(uac & 0x0002)  # ACCOUNTDISABLE
-                user['trustedToAuth'] = bool(uac & 0x1000000)  # TRUSTED_TO_AUTH_FOR_DELEGATION
-                user['passwordNotRequired'] = bool(uac & 0x0020)  # PASSWD_NOTREQD
-                user['dontRequirePreauth'] = bool(uac & 0x400000)  # DONT_REQ_PREAUTH
-            
-            # Privileged user markers
-            if 'adminCount' in attrs:
-                user['adminCount'] = attrs['adminCount'][0] if isinstance(attrs['adminCount'], list) else attrs['adminCount']
-            
-            # Kerberos delegation
-            if 'servicePrincipalName' in attrs:
-                spns = attrs['servicePrincipalName']
-                user['servicePrincipalName'] = spns if isinstance(spns, list) else [spns]
-            
-            if 'msDS-AllowedToDelegateTo' in attrs:
-                delegates = attrs['msDS-AllowedToDelegateTo']
-                user['allowedToDelegateTo'] = delegates if isinstance(delegates, list) else [delegates]
-            
-            # RBCD
-            if 'msDS-AllowedToActOnBehalfOfOtherIdentity' in attrs:
-                user['allowedToActOnBehalfOfOtherIdentity'] = True
-            
-            # Primary group
-            if 'primaryGroupID' in attrs:
-                user['primaryGroupID'] = attrs['primaryGroupID'][0] if isinstance(attrs['primaryGroupID'], list) else attrs['primaryGroupID']
-            
-            # SID History (privilege escalation vector)
-            if 'sIDHistory' in attrs:
-                history = attrs['sIDHistory']
-                user['sIDHistory'] = history if isinstance(history, list) else [history]
-            
-            # Security descriptor for ACLs (convert to base64 for storage)
-            if 'nTSecurityDescriptor' in attrs:
-                sd = attrs['nTSecurityDescriptor']
-                if sd:
-                    import base64
-                    if isinstance(sd, bytes):
-                        user['nTSecurityDescriptor'] = base64.b64encode(sd).decode('utf-8')
-                    elif isinstance(sd, list) and sd:
-                        user['nTSecurityDescriptor'] = base64.b64encode(sd[0]).decode('utf-8')
-            
-            users.append(user)
+            except Exception as e:
+                print(f"[!] Warning: Error processing entry: {e}", file=sys.stderr)
+                continue
         
     except Exception as e:
         print(f"[-] Error getting users: {e}")
