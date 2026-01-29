@@ -14,7 +14,7 @@ When using ntlmrelayx with SOCKS5 proxying for LDAP sessions, most tools fail:
 - ldapdomaindump → Invalid messageId / socket receive errors
 - NetExec/CrackMapExec → Index out of range errors
 - Standard ldap3 scripts → Session terminated by server
-- bloodhound-python → did not work with an IP as domaincontroller target
+- bloodhound-python → Could not authenticate to DC by IP only by hostname, (might work?)
 
 ROOT CAUSE:
 ntlmrelayx's SOCKS5 LDAP proxy has limitations:
@@ -28,7 +28,9 @@ This script uses the exact same ldap3 configuration as Certipy:
 - NTLM authentication with DOMAIN\\username format
 - Default SYNC client strategy (no custom strategies)
 - paged_search() with generator=True for all queries
-- Increased receive_timeout (100s) for SOCKS proxy latency
+- Increased timeouts for SOCKS latency:
+  * connect_timeout: 30s (connection establishment)
+  * receive_timeout: 600s (10 minutes for large queries via SOCKS)
 - auto_referrals=False to prevent connection issues
 
 OUTPUT FORMATS:
@@ -39,21 +41,21 @@ OUTPUT FORMATS:
 USAGE EXAMPLES:
 
 1. Default - BloodHound Legacy v4 format (most compatible):
-   proxychains python3 ldap_ntlm_enum.py -H 10.1.0.31 -d EXAMPLE -u <username> --all -o loot
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --all -o loot
    # Creates: loot_bhlegacy_YYYYMMDD_HHMMSS/ with 7 JSON files
    # Import to BloodHound 4.2 or 4.3
 
 2. BloodHound CE v5 format:
-   proxychains python3 ldap_ntlm_enum.py -H 10.1.0.31 -d EXAMPLE -u <username> --all -o loot --bloodhound-ce
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --all -o loot --bloodhound-ce
    # Creates: loot_bhce_YYYYMMDD_HHMMSS/ with 7 JSON files
    # Import to BloodHound CE (v5.0+)
 
 3. BOFHound format (single JSON + text files):
-   proxychains python3 ldap_ntlm_enum.py -H 10.1.0.31 -d EXAMPLE -u <username> --all -o loot --bofhound
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --all -o loot --bofhound
    # Creates: loot_YYYYMMDD_HHMMSS.json + text files
 
 4. Specific enumeration (Kerberoastable users only):
-   proxychains python3 ldap_ntlm_enum.py -H 10.1.0.31 -d EXAMPLE -u <username> --kerberoastable -o kerb
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d CONTOSO -u jdoe --kerberoastable -o kerb
 
 USAGE WITH NTLMRELAYX:
 1. Start ntlmrelayx with SOCKS:
@@ -62,10 +64,10 @@ USAGE WITH NTLMRELAYX:
 2. Capture/relay authentication to get LDAP session:
    ntlmrelayx> socks
    Protocol  Target     Username         AdminStatus  Port
-   LDAP      10.1.0.31  DOMAIN/username  N/A          389
+   LDAP      10.10.10.10  DOMAIN/username  N/A          389
 
 3. Run this script through proxychains:
-   proxychains python3 ldap_ntlm_enum.py -H 10.1.0.31 -d DOMAIN -u username --all -o output
+   proxychains python3 ldap_ntlm_enum.py -H 10.10.10.10 -d DOMAIN -u username --all -o output
 
 The script will automatically detect the base DN and enumerate users/computers.
 
@@ -99,6 +101,7 @@ from ldap3 import Server, Connection, NTLM, SUBTREE, ALL_ATTRIBUTES
 import sys
 import argparse
 import json
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -129,6 +132,26 @@ COLLECTION_METHOD_CONTAINER = 2048
 DCONLY_BITMASK = (COLLECTION_METHOD_GROUP | COLLECTION_METHOD_TRUSTS | 
                   COLLECTION_METHOD_ACL | COLLECTION_METHOD_OBJECTPROPS | 
                   COLLECTION_METHOD_CONTAINER)  # = 3210
+
+def sanitize_for_json(obj):
+    """
+    Recursively convert bytes objects to base64 strings for JSON serialization
+    """
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode('utf-8')
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    else:
+        return obj
+
+def safe_json_dump(data, file_obj, **kwargs):
+    """
+    Safely dump data to JSON, converting any bytes to base64 strings
+    """
+    sanitized_data = sanitize_for_json(data)
+    safe_json_dump(sanitized_data, file_obj, **kwargs)
 
 # BloodHound Legacy trust value mappings
 TRUST_DIRECTION_MAP = {
@@ -851,8 +874,11 @@ def save_output(data, output_dir, domain, output_format='legacy'):
             else:
                 json_filename = output_path / f"ldap_enum_{domain}_{timestamp}.json"
             
+            # Sanitize bytes objects before JSON serialization
+            sanitized_data = sanitize_for_json(data)
+            
             with open(json_filename, 'w') as f:
-                json.dump(data, f, indent=2)
+                safe_json_dump(sanitized_data, f, indent=2)
             
             print(f"\n[+] BOFHound JSON saved to: {json_filename}")
             print(f"[*] BOFHound import: bofhound -i {json_filename}")
@@ -1005,7 +1031,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
                 domains_data['data'][0]['Trusts'].append(trust_obj)
         
         with open(output_dir / 'domains.json', 'w') as f:
-            json.dump(domains_data, f, indent=2)
+            safe_json_dump(domains_data, f, indent=2)
         files_created.append('domains.json')
     
     # 2. USERS.JSON
@@ -1056,7 +1082,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'users.json', 'w') as f:
-            json.dump(users_data, f, indent=2)
+            safe_json_dump(users_data, f, indent=2)
         files_created.append('users.json')
     
     # 3. COMPUTERS.JSON
@@ -1098,7 +1124,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'computers.json', 'w') as f:
-            json.dump(computers_data, f, indent=2)
+            safe_json_dump(computers_data, f, indent=2)
         files_created.append('computers.json')
     
     # 4. GROUPS.JSON
@@ -1130,7 +1156,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'groups.json', 'w') as f:
-            json.dump(groups_data, f, indent=2)
+            safe_json_dump(groups_data, f, indent=2)
         files_created.append('groups.json')
     
     # 5. GPOS.JSON
@@ -1159,7 +1185,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'gpos.json', 'w') as f:
-            json.dump(gpos_data, f, indent=2)
+            safe_json_dump(gpos_data, f, indent=2)
         files_created.append('gpos.json')
     
     # 6. OUS.JSON
@@ -1190,7 +1216,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'ous.json', 'w') as f:
-            json.dump(ous_data, f, indent=2)
+            safe_json_dump(ous_data, f, indent=2)
         files_created.append('ous.json')
     
     # 7. CONTAINERS.JSON
@@ -1219,7 +1245,7 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         }
         
         with open(output_dir / 'containers.json', 'w') as f:
-            json.dump(containers_data, f, indent=2)
+            safe_json_dump(containers_data, f, indent=2)
         files_created.append('containers.json')
     
     return files_created
@@ -1269,7 +1295,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                 json_filename = output_path / f"ldap_enum_{domain}_{timestamp}.json"
             
             with open(json_filename, 'w') as f:
-                json.dump(data, f, indent=2)
+                safe_json_dump(data, f, indent=2)
             
             print(f"\n[+] JSON output saved to: {json_filename}")
             print(f"[*] BOFHound import: bofhound -i {json_filename}")
@@ -1388,7 +1414,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                 domains_data['data'][0]['Trusts'].append(trust_obj)
         
         with open(output_dir / 'domains.json', 'w') as f:
-            json.dump(domains_data, f, indent=2)
+            safe_json_dump(domains_data, f, indent=2)
         files_created.append('domains.json')
     
     # 2. USERS.JSON
@@ -1439,7 +1465,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'users.json', 'w') as f:
-            json.dump(users_data, f, indent=2)
+            safe_json_dump(users_data, f, indent=2)
         files_created.append('users.json')
     
     # 3. COMPUTERS.JSON
@@ -1481,7 +1507,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'computers.json', 'w') as f:
-            json.dump(computers_data, f, indent=2)
+            safe_json_dump(computers_data, f, indent=2)
         files_created.append('computers.json')
     
     # 4. GROUPS.JSON
@@ -1513,7 +1539,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'groups.json', 'w') as f:
-            json.dump(groups_data, f, indent=2)
+            safe_json_dump(groups_data, f, indent=2)
         files_created.append('groups.json')
     
     # 5. GPOS.JSON
@@ -1542,7 +1568,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'gpos.json', 'w') as f:
-            json.dump(gpos_data, f, indent=2)
+            safe_json_dump(gpos_data, f, indent=2)
         files_created.append('gpos.json')
     
     # 6. OUS.JSON
@@ -1573,7 +1599,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'ous.json', 'w') as f:
-            json.dump(ous_data, f, indent=2)
+            safe_json_dump(ous_data, f, indent=2)
         files_created.append('ous.json')
     
     # 7. CONTAINERS.JSON
@@ -1602,7 +1628,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
         }
         
         with open(output_dir / 'containers.json', 'w') as f:
-            json.dump(containers_data, f, indent=2)
+            safe_json_dump(containers_data, f, indent=2)
         files_created.append('containers.json')
     
     return files_created
@@ -1636,7 +1662,7 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
             json_filename = output_path / f"ldap_enum_{domain}{format_suffix}_{timestamp}.json"
         
         with open(json_filename, 'w') as f:
-            json.dump(data, f, indent=2)
+            safe_json_dump(data, f, indent=2)
         
         if bloodhound_ce:
             print(f"[+] BloodHound CE JSON saved to: {json_filename}")
@@ -1809,7 +1835,7 @@ def convert_to_bloodhound_ce(data, domain):
             json_filename = output_path / f"ldap_enum_{domain}_{timestamp}.json"
         
         with open(json_filename, 'w') as f:
-            json.dump(data, f, indent=2)
+            safe_json_dump(data, f, indent=2)
         
         print(f"\n[+] JSON output saved to: {json_filename}")
         print(f"[*] BOFHound import: bofhound -i {json_filename}")
@@ -1877,7 +1903,8 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
                    enum_users=False, enum_computers=False, enum_groups=False, 
                    enum_trusts=False, enum_gpos=False, enum_ous=False, enum_containers=False,
                    enum_kerberoastable=False, enum_asreproast=False, 
-                   enum_domain_info=False, enum_all=False, output_format='legacy'):
+                   enum_domain_info=False, enum_all=False, output_format='legacy', 
+                   timeout=600):
     """
     Enumerate LDAP using ldap3 with NTLM authentication
     This mimics how Certipy connects and works with ntlmrelayx SOCKS
@@ -1905,9 +1932,10 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
     
     print(f"[*] Connecting to {host}:{port}")
     print(f"[*] Using NTLM authentication as: {ntlm_user}")
+    print(f"[*] LDAP timeout: {timeout}s (use -t to adjust for slow SOCKS connections)")
     
     # Create server (no SSL, no server info gathering)
-    server = Server(host, port=port, get_info=None, connect_timeout=10)
+    server = Server(host, port=port, get_info=None, connect_timeout=30)
     
     # Create connection with NTLM authentication
     # Use default SYNC strategy (like Certipy) - RESTARTABLE doesn't work with SOCKS
@@ -1920,7 +1948,7 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
         auto_bind=False,
         auto_referrals=False,  # Certipy uses this
         raise_exceptions=False,
-        receive_timeout=100,  # Increased for SOCKS proxy latency
+        receive_timeout=timeout,  # Configurable timeout for SOCKS (default 600s)
         return_empty_attributes=False
     )
     
@@ -2043,7 +2071,7 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
     print(f"[*] Using NTLM authentication as: {ntlm_user}")
     
     # Create server (no SSL, no server info gathering)
-    server = Server(host, port=port, get_info=None, connect_timeout=10)
+    server = Server(host, port=port, get_info=None, connect_timeout=30)
     
     # Create connection with NTLM authentication
     # Use default SYNC strategy (like Certipy) - RESTARTABLE doesn't work with SOCKS
@@ -2056,7 +2084,7 @@ def enumerate_ldap(host, port, domain, username, password, base_dn=None, output_
         auto_bind=False,
         auto_referrals=False,  # Certipy uses this
         raise_exceptions=False,
-        receive_timeout=100,  # Increased for SOCKS proxy latency
+        receive_timeout=timeout,  # Configurable timeout for SOCKS (default 600s)
         return_empty_attributes=False
     )
     
@@ -2085,15 +2113,15 @@ def main():
         epilog='''
 Examples:
   # Full enumeration (all queries)
-  proxychains python3 %(prog)s -H 10.1.0.31 -d EXAMPLE -u <username> --all -o /tmp/output
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --all -o /tmp/output
 
   # Specific queries
-  proxychains python3 %(prog)s -H 10.1.0.31 -d EXAMPLE -u <username> --users --computers
-  proxychains python3 %(prog)s -H 10.1.0.31 -d EXAMPLE -u <username> --kerberoastable
-  proxychains python3 %(prog)s -H 10.1.0.31 -d EXAMPLE -u <username> --asreproast
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --users --computers
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --kerberoastable
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe --asreproast
   
   # With manual base DN
-  proxychains python3 %(prog)s -H 10.1.0.31 -d EXAMPLE -u <username> -b "DC=example,DC=domain,DC=com" --all
+  proxychains python3 %(prog)s -H 10.10.10.10 -d CONTOSO -u jdoe -b "DC=contoso,DC=local" --all
         ''',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -2101,10 +2129,12 @@ Examples:
     # Connection options
     parser.add_argument('-H', '--host', required=True, help='LDAP server IP')
     parser.add_argument('-p', '--port', type=int, default=389, help='LDAP port (default: 389)')
-    parser.add_argument('-d', '--domain', required=True, help='Domain name (e.g., EXAMPLE or example.domain.com)')
+    parser.add_argument('-d', '--domain', required=True, help='Domain name (e.g., CONTOSO or contoso.local)')
     parser.add_argument('-u', '--username', required=True, help='Username (from ntlmrelayx SOCKS session)')
     parser.add_argument('-P', '--password', default='dummy', help='Password (default: dummy - ignored by SOCKS)')
     parser.add_argument('-b', '--base-dn', help='Base DN (auto-detected if not provided)')
+    parser.add_argument('-t', '--timeout', type=int, default=600, 
+                       help='LDAP receive timeout in seconds (default: 600 for SOCKS)')
     
     # Output options
     parser.add_argument('-o', '--output', help='Output directory for results')
@@ -2183,7 +2213,8 @@ Examples:
             enum_asreproast=args.asreproast,
             enum_domain_info=args.domain_info,
             enum_all=args.all,
-            output_format=output_format
+            output_format=output_format,
+            timeout=args.timeout
         )
     except Exception as e:
         print(f"[-] Error: {e}")
