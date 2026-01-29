@@ -983,20 +983,20 @@ def save_text_files(data, output_path, domain, timestamp, base_name=None):
 
 def convert_to_bloodhound_legacy(data, domain, output_dir):
     """
-    Convert to BloodHound Legacy v4 format (compatible with BloodHound 4.2/4.3)
-    
+    Convert to BloodHound Legacy format (compatible with BloodHound 4.x and bloodhound.py)
+
     Key differences from CE:
-    - version: 4 (not 5)
+    - version: 5 (BloodHound.py uses 5)
     - Trust values are integers (not strings)
     - Methods bitmask for DCOnly
     """
     files_created = []
-    
+
     meta = {
-        "methods": DCONLY_BITMASK,
+        "methods": 0,
         "type": "",
         "count": 0,
-        "version": 4  # Legacy v4
+        "version": 5  # BloodHound.py uses version 5
     }
     
     domain_upper = domain.upper()
@@ -1004,23 +1004,32 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
     # 1. DOMAINS.JSON
     if 'domain_info' in data.get('data', {}):
         info = data['data']['domain_info']
-        
+
         domains_data = {
             "data": [{
-                "ObjectIdentifier": domain_upper,
+                "ObjectIdentifier": info.get('objectSid', domain_upper),
                 "Properties": {
                     "domain": domain_upper,
                     "name": domain_upper,
-                    "distinguishedname": f"DC={domain.replace('.', ',DC=')}",
+                    "distinguishedname": f"DC={domain.replace('.', ',DC=')}".upper(),
                     "domainsid": info.get('objectSid', f"S-1-5-21-{domain_upper}"),
                     "functionallevel": info.get('functional_level', 'Unknown'),
-                    "description": f"Domain {domain}"
+                    "description": info.get('description') or '',
+                    "highvalue": True,
+                    "whencreated": 0
                 },
                 "Trusts": [],
+                "Links": [],
                 "ChildObjects": [],
+                "GPOChanges": {
+                    "AffectedComputers": [],
+                    "DcomUsers": [],
+                    "LocalAdmins": [],
+                    "PSRemoteUsers": [],
+                    "RemoteDesktopUsers": []
+                },
                 "Aces": [],
-                "IsDeleted": False,
-                "IsACLProtected": False
+                "IsDeleted": False
             }],
             "meta": dict(meta, type="domains", count=1)
         }
@@ -1050,25 +1059,34 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
     if 'users' in data.get('data', {}):
         users_bh = []
         for user in data['data']['users']:
+            lastlogontimestamp = user.get('lastLogonTimestamp', 0)
+            if lastlogontimestamp == 0:
+                lastlogontimestamp = -1
+
             user_obj = {
                 "ObjectIdentifier": user.get('objectSid', user.get('distinguishedName', '')),
                 "Properties": {
                     "domain": domain_upper,
                     "name": f"{user.get('sAMAccountName', 'UNKNOWN')}@{domain_upper}",
-                    "distinguishedname": user.get('distinguishedName', ''),
+                    "distinguishedname": user.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
                     "samaccountname": user.get('sAMAccountName', ''),
-                    "description": user.get('description', ''),
+                    "description": user.get('description'),
+                    "whencreated": 0,
                     "enabled": user.get('enabled', True),
                     "pwdlastset": user.get('pwdLastSet', 0),
                     "lastlogon": user.get('lastLogon', 0),
-                    "lastlogontimestamp": user.get('lastLogonTimestamp', 0),
-                    "displayname": user.get('displayName', ''),
-                    "email": user.get('mail', ''),
-                    "title": user.get('title', ''),
-                    "homedirectory": user.get('homeDirectory', ''),
+                    "lastlogontimestamp": lastlogontimestamp,
+                    "displayname": user.get('displayName'),
+                    "email": user.get('mail'),
+                    "title": user.get('title'),
+                    "homedirectory": user.get('homeDirectory'),
                     "userpassword": None,
-                    "admincount": bool(user.get('adminCount', 0)),
+                    "unixpassword": None,
+                    "unicodepassword": None,
+                    "sfupassword": None,
+                    "logonscript": None,
+                    "admincount": user.get('adminCount', 0) == 1,
                     "sensitive": user.get('passwordNotRequired', False),
                     "dontreqpreauth": user.get('dontRequirePreauth', False),
                     "passwordnotreqd": user.get('passwordNotRequired', False),
@@ -1076,14 +1094,14 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
                     "pwdneverexpires": False,
                     "trustedtoauth": user.get('trustedToAuth', False),
                     "hasspn": bool(user.get('servicePrincipalName')),
-                    "serviceprincipalnames": user.get('servicePrincipalName', [])
+                    "serviceprincipalnames": user.get('servicePrincipalName', []),
+                    "sidhistory": []
                 },
                 "PrimaryGroupSid": user.get('primaryGroupID', ''),
-                "AllowedToDelegate": user.get('allowedToDelegateTo', []),
+                "AllowedToDelegate": [],
                 "SPNTargets": [],
                 "HasSIDHistory": [],
                 "IsDeleted": False,
-                "IsACLProtected": False,
                 "Aces": []
             }
             users_bh.append(user_obj)
@@ -1101,32 +1119,45 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
     if 'computers' in data.get('data', {}):
         computers_bh = []
         for computer in data['data']['computers']:
+            lastlogontimestamp = computer.get('lastLogonTimestamp', 0)
+            if lastlogontimestamp == 0:
+                lastlogontimestamp = -1
+
             comp_obj = {
                 "ObjectIdentifier": computer.get('objectSid', computer.get('distinguishedName', '')),
                 "Properties": {
                     "domain": domain_upper,
                     "name": computer.get('dNSHostName', computer.get('sAMAccountName', '')).upper(),
-                    "distinguishedname": computer.get('distinguishedName', ''),
+                    "distinguishedname": computer.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
                     "samaccountname": computer.get('sAMAccountName', ''),
-                    "description": "",
+                    "description": computer.get('description'),
+                    "whencreated": 0,
                     "enabled": computer.get('enabled', True),
                     "unconstraineddelegation": computer.get('unconstrainedDelegation', False),
                     "trustedtoauth": computer.get('trustedToAuth', False),
+                    "haslaps": False,
                     "lastlogon": computer.get('lastLogon', 0),
-                    "lastlogontimestamp": computer.get('lastLogonTimestamp', 0),
+                    "lastlogontimestamp": lastlogontimestamp,
                     "pwdlastset": computer.get('pwdLastSet', 0),
-                    "serviceprincipalnames": [],
-                    "operatingsystem": computer.get('operatingSystem', ''),
+                    "serviceprincipalnames": computer.get('servicePrincipalName', []),
+                    "operatingsystem": computer.get('operatingSystem'),
                     "sidhistory": []
                 },
                 "PrimaryGroupSid": computer.get('primaryGroupID', ''),
-                "AllowedToDelegate": computer.get('allowedToDelegateTo', []),
+                "LocalAdmins": {"Collected": False, "FailureReason": None, "Results": []},
+                "PSRemoteUsers": {"Collected": False, "FailureReason": None, "Results": []},
+                "RemoteDesktopUsers": {"Collected": False, "FailureReason": None, "Results": []},
+                "DcomUsers": {"Collected": False, "FailureReason": None, "Results": []},
+                "AllowedToDelegate": [],
                 "AllowedToAct": [],
+                "Sessions": {"Collected": False, "FailureReason": None, "Results": []},
+                "PrivilegedSessions": {"Collected": False, "FailureReason": None, "Results": []},
+                "RegistrySessions": {"Collected": False, "FailureReason": None, "Results": []},
                 "HasSIDHistory": [],
                 "IsDeleted": False,
-                "IsACLProtected": False,
-                "Aces": []
+                "Aces": [],
+                "Status": None
             }
             computers_bh.append(comp_obj)
         
@@ -1141,24 +1172,37 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
     
     # 4. GROUPS.JSON
     if 'groups' in data.get('data', {}):
+        # Well-known high-value groups (from BloodHound.py)
+        highvalue_sids = ["S-1-5-32-544", "S-1-5-32-550", "S-1-5-32-549", "S-1-5-32-551", "S-1-5-32-548"]
+
+        def is_highvalue(sid):
+            if not sid:
+                return False
+            if sid.endswith("-512") or sid.endswith("-516") or sid.endswith("-519"):
+                return True
+            if sid in highvalue_sids:
+                return True
+            return False
+
         groups_bh = []
         for group in data['data']['groups']:
+            sid = group.get('objectSid', '')
             group_obj = {
-                "ObjectIdentifier": group.get('objectSid', group.get('distinguishedName', '')),
+                "ObjectIdentifier": sid,
                 "Properties": {
                     "domain": domain_upper,
                     "name": f"{group.get('sAMAccountName', 'UNKNOWN')}@{domain_upper}",
-                    "distinguishedname": group.get('distinguishedName', ''),
+                    "distinguishedname": group.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
                     "samaccountname": group.get('sAMAccountName', ''),
-                    "description": group.get('description', ''),
-                    "admincount": bool(group.get('adminCount', 0)),
-                    "highvalue": False
+                    "description": group.get('description'),
+                    "whencreated": 0,
+                    "admincount": group.get('adminCount', 0) == 1,
+                    "highvalue": is_highvalue(sid)
                 },
                 "Members": [],
                 "Aces": [],
-                "IsDeleted": False,
-                "IsACLProtected": False
+                "IsDeleted": False
             }
             groups_bh.append(group_obj)
         
@@ -1180,14 +1224,13 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
                 "Properties": {
                     "domain": domain_upper,
                     "name": gpo.get('displayName', 'UNKNOWN') + "@" + domain_upper,
-                    "distinguishedname": gpo.get('distinguishedName', ''),
+                    "distinguishedname": gpo.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
                     "gpcpath": gpo.get('gPCFileSysPath', ''),
-                    "description": ""
+                    "description": gpo.get('description')
                 },
                 "Aces": [],
-                "IsDeleted": False,
-                "IsACLProtected": False
+                "IsDeleted": False
             }
             gpos_bh.append(gpo_obj)
         
@@ -1205,49 +1248,47 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         ous_bh = []
         for ou in data['data']['ous']:
             ou_obj = {
-                "ObjectIdentifier": ou.get('distinguishedName', ''),
+                "ObjectIdentifier": ou.get('distinguishedName', '').upper(),
                 "Properties": {
                     "domain": domain_upper,
                     "name": ou.get('name', 'UNKNOWN'),
-                    "distinguishedname": ou.get('distinguishedName', ''),
+                    "distinguishedname": ou.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
-                    "description": ou.get('description', ''),
+                    "description": ou.get('description'),
                     "blocksinheritance": False
                 },
                 "Links": [],
                 "ChildObjects": [],
                 "Aces": [],
-                "IsDeleted": False,
-                "IsACLProtected": False
+                "IsDeleted": False
             }
             ous_bh.append(ou_obj)
-        
+
         ous_data = {
             "data": ous_bh,
             "meta": dict(meta, type="ous", count=len(ous_bh))
         }
-        
+
         with open(output_dir / 'ous.json', 'w') as f:
             safe_json_dump(ous_data, f, indent=2)
         files_created.append('ous.json')
-    
+
     # 7. CONTAINERS.JSON
     if 'containers' in data.get('data', {}):
         containers_bh = []
         for container in data['data']['containers']:
             cont_obj = {
-                "ObjectIdentifier": container.get('distinguishedName', ''),
+                "ObjectIdentifier": container.get('distinguishedName', '').upper(),
                 "Properties": {
                     "domain": domain_upper,
                     "name": container.get('name', 'UNKNOWN'),
-                    "distinguishedname": container.get('distinguishedName', ''),
+                    "distinguishedname": container.get('distinguishedName', '').upper(),
                     "domainsid": domain_upper,
-                    "description": container.get('description', '')
+                    "description": container.get('description')
                 },
                 "ChildObjects": [],
                 "Aces": [],
-                "IsDeleted": False,
-                "IsACLProtected": False
+                "IsDeleted": False
             }
             containers_bh.append(cont_obj)
         
@@ -1265,24 +1306,24 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
 def convert_to_bloodhound_ce(data, domain, output_dir):
     """
     Convert our data format to BloodHound CE compatible JSON files
-    
+
     Creates separate files for each object type as BloodHound CE expects
     """
     files_created = []
-    
+
     meta = {
         "methods": 0,
         "type": "azure",
         "count": 0,
-        "version": 5
+        "version": 6
     }
-    
+
     domain_upper = domain.upper()
-    
+
     # 1. DOMAINS.JSON
     if 'domain_info' in data.get('data', {}):
         info = data['data']['domain_info']
-        
+
         domains_data = {
             "data": [{
                 "ObjectIdentifier": domain_upper,
@@ -1291,14 +1332,19 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "name": domain_upper,
                     "distinguishedname": f"DC={domain.replace('.', ',DC=')}",
                     "domainsid": info.get('objectSid', f"S-1-5-21-{domain_upper}"),
+                    "isaclprotected": False,
+                    "description": None,
+                    "whencreated": 0,
                     "functionallevel": info.get('functional_level', 'Unknown'),
-                    "description": f"Domain {domain}"
+                    "collected": True
                 },
                 "Trusts": [],
+                "Links": [],
                 "ChildObjects": [],
                 "Aces": [],
                 "IsDeleted": False,
-                "IsACLProtected": False
+                "IsACLProtected": False,
+                "ContainedBy": None
             }],
             "meta": dict(meta, type="domains", count=1)
         }
@@ -1332,15 +1378,17 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "distinguishedname": user.get('distinguishedName', ''),
                     "domainsid": domain_upper,
                     "samaccountname": user.get('sAMAccountName', ''),
-                    "description": user.get('description', ''),
+                    "isaclprotected": False,
+                    "description": user.get('description') or None,
+                    "whencreated": 0,
                     "enabled": user.get('enabled', True),
                     "pwdlastset": user.get('pwdLastSet', 0),
                     "lastlogon": user.get('lastLogon', 0),
                     "lastlogontimestamp": user.get('lastLogonTimestamp', 0),
-                    "displayname": user.get('displayName', ''),
-                    "email": user.get('mail', ''),
-                    "title": user.get('title', ''),
-                    "homedirectory": user.get('homeDirectory', ''),
+                    "displayname": user.get('displayName') or None,
+                    "email": user.get('mail') or None,
+                    "title": user.get('title') or None,
+                    "homedirectory": user.get('homeDirectory') or None,
                     "userpassword": None,
                     "admincount": bool(user.get('adminCount', 0)),
                     "sensitive": user.get('passwordNotRequired', False),
@@ -1350,7 +1398,8 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "pwdneverexpires": False,
                     "trustedtoauth": user.get('trustedToAuth', False),
                     "hasspn": bool(user.get('servicePrincipalName')),
-                    "serviceprincipalnames": user.get('servicePrincipalName', [])
+                    "serviceprincipalnames": user.get('servicePrincipalName', []),
+                    "sidhistory": []
                 },
                 "PrimaryGroupSid": user.get('primaryGroupID', ''),
                 "AllowedToDelegate": user.get('allowedToDelegateTo', []),
@@ -1358,19 +1407,19 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                 "HasSIDHistory": [],
                 "IsDeleted": False,
                 "IsACLProtected": False,
-                "Aces": []  # Would need ACL parsing
+                "Aces": []
             }
             users_bh.append(user_obj)
-        
+
         users_data = {
             "data": users_bh,
             "meta": dict(meta, type="users", count=len(users_bh))
         }
-        
+
         with open(output_dir / 'users.json', 'w') as f:
             safe_json_dump(users_data, f, indent=2)
         files_created.append('users.json')
-    
+
     # 3. COMPUTERS.JSON
     if 'computers' in data.get('data', {}):
         computers_bh = []
@@ -1383,36 +1432,45 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "distinguishedname": computer.get('distinguishedName', ''),
                     "domainsid": domain_upper,
                     "samaccountname": computer.get('sAMAccountName', ''),
-                    "description": "",
+                    "haslaps": False,
+                    "isaclprotected": False,
+                    "description": None,
+                    "whencreated": 0,
                     "enabled": computer.get('enabled', True),
                     "unconstraineddelegation": computer.get('unconstrainedDelegation', False),
                     "trustedtoauth": computer.get('trustedToAuth', False),
+                    "isdc": False,
                     "lastlogon": computer.get('lastLogon', 0),
                     "lastlogontimestamp": computer.get('lastLogonTimestamp', 0),
                     "pwdlastset": computer.get('pwdLastSet', 0),
-                    "serviceprincipalnames": [],
-                    "operatingsystem": computer.get('operatingSystem', ''),
+                    "serviceprincipalnames": computer.get('servicePrincipalName', []),
+                    "email": None,
+                    "operatingsystem": computer.get('operatingSystem') or None,
                     "sidhistory": []
                 },
                 "PrimaryGroupSid": computer.get('primaryGroupID', ''),
                 "AllowedToDelegate": computer.get('allowedToDelegateTo', []),
                 "AllowedToAct": [],
                 "HasSIDHistory": [],
+                "DumpSMSAPassword": [],
+                "Sessions": {"Results": [], "Collected": False, "FailureReason": None},
+                "PrivilegedSessions": {"Results": [], "Collected": False, "FailureReason": None},
+                "RegistrySessions": {"Results": [], "Collected": False, "FailureReason": None},
                 "IsDeleted": False,
                 "IsACLProtected": False,
                 "Aces": []
             }
             computers_bh.append(comp_obj)
-        
+
         computers_data = {
             "data": computers_bh,
             "meta": dict(meta, type="computers", count=len(computers_bh))
         }
-        
+
         with open(output_dir / 'computers.json', 'w') as f:
             safe_json_dump(computers_data, f, indent=2)
         files_created.append('computers.json')
-    
+
     # 4. GROUPS.JSON
     if 'groups' in data.get('data', {}):
         groups_bh = []
@@ -1425,26 +1483,27 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "distinguishedname": group.get('distinguishedName', ''),
                     "domainsid": domain_upper,
                     "samaccountname": group.get('sAMAccountName', ''),
-                    "description": group.get('description', ''),
-                    "admincount": bool(group.get('adminCount', 0)),
-                    "highvalue": False  # Would need well-known SID check
+                    "isaclprotected": False,
+                    "description": group.get('description') or None,
+                    "whencreated": 0,
+                    "admincount": bool(group.get('adminCount', 0))
                 },
-                "Members": [],  # Would need to resolve from 'member' DNs
+                "Members": [],
                 "Aces": [],
                 "IsDeleted": False,
                 "IsACLProtected": False
             }
             groups_bh.append(group_obj)
-        
+
         groups_data = {
             "data": groups_bh,
             "meta": dict(meta, type="groups", count=len(groups_bh))
         }
-        
+
         with open(output_dir / 'groups.json', 'w') as f:
             safe_json_dump(groups_data, f, indent=2)
         files_created.append('groups.json')
-    
+
     # 5. GPOS.JSON
     if 'gpos' in data.get('data', {}):
         gpos_bh = []
@@ -1456,8 +1515,10 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "name": gpo.get('displayName', 'UNKNOWN') + "@" + domain_upper,
                     "distinguishedname": gpo.get('distinguishedName', ''),
                     "domainsid": domain_upper,
-                    "gpcpath": gpo.get('gPCFileSysPath', ''),
-                    "description": ""
+                    "isaclprotected": False,
+                    "description": None,
+                    "whencreated": 0,
+                    "gpcpath": gpo.get('gPCFileSysPath', '')
                 },
                 "Aces": [],
                 "IsDeleted": False,
@@ -1485,26 +1546,28 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "name": ou.get('name', 'UNKNOWN'),
                     "distinguishedname": ou.get('distinguishedName', ''),
                     "domainsid": domain_upper,
-                    "description": ou.get('description', ''),
+                    "isaclprotected": False,
+                    "description": ou.get('description') or None,
+                    "whencreated": 0,
                     "blocksinheritance": False
                 },
-                "Links": [],  # Would parse from gPLink
+                "Links": [],
                 "ChildObjects": [],
                 "Aces": [],
                 "IsDeleted": False,
                 "IsACLProtected": False
             }
             ous_bh.append(ou_obj)
-        
+
         ous_data = {
             "data": ous_bh,
             "meta": dict(meta, type="ous", count=len(ous_bh))
         }
-        
+
         with open(output_dir / 'ous.json', 'w') as f:
             safe_json_dump(ous_data, f, indent=2)
         files_created.append('ous.json')
-    
+
     # 7. CONTAINERS.JSON
     if 'containers' in data.get('data', {}):
         containers_bh = []
@@ -1516,7 +1579,9 @@ def convert_to_bloodhound_ce(data, domain, output_dir):
                     "name": container.get('name', 'UNKNOWN'),
                     "distinguishedname": container.get('distinguishedName', ''),
                     "domainsid": domain_upper,
-                    "description": container.get('description', '')
+                    "isaclprotected": False,
+                    "description": container.get('description') or None,
+                    "whencreated": 0
                 },
                 "ChildObjects": [],
                 "Aces": [],
