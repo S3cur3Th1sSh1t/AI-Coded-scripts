@@ -1610,8 +1610,78 @@ def get_asreproastable(conn, base_dn):
         print(f"[-] Error getting AS-REP roastable accounts: {e}")
     
     return asreproastable
-    
-    return asreproastable
+
+def custom_ldap_query(conn, base_dn, search_filter, attributes=None, search_scope=SUBTREE):
+    """
+    Execute a custom LDAP query with specified filter and attributes
+
+    Args:
+        conn: LDAP connection object
+        base_dn: Base DN for the search
+        search_filter: LDAP filter string (e.g., '(objectClass=user)')
+        attributes: List of attributes to retrieve (None = all attributes)
+        search_scope: Search scope (SUBTREE, BASE, LEVEL)
+
+    Returns:
+        List of matching entries with their attributes
+    """
+    results = []
+    try:
+        print(f"[*] Executing custom LDAP query...")
+        print(f"    Base DN: {base_dn}")
+        print(f"    Filter: {search_filter}")
+        if attributes:
+            print(f"    Attributes: {', '.join(attributes)}")
+        else:
+            print(f"    Attributes: ALL")
+
+        entries = conn.extend.standard.paged_search(
+            search_base=base_dn,
+            search_filter=search_filter,
+            search_scope=search_scope,
+            attributes=attributes if attributes else ['*'],
+            paged_size=500,
+            generator=True
+        )
+
+        count = 0
+        for entry in entries:
+            if entry['type'] != 'searchResEntry':
+                continue
+
+            count += 1
+            if count % 50 == 0:
+                print(f"    ... {count} entries", end='\r')
+
+            attrs = entry.get('attributes', {})
+            dn = entry.get('dn', '')
+
+            # Build result entry
+            result_entry = {'dn': dn}
+
+            # Add all attributes
+            for key, val in attrs.items():
+                if isinstance(val, list):
+                    if len(val) == 1:
+                        result_entry[key] = val[0]
+                    elif len(val) == 0:
+                        result_entry[key] = None
+                    else:
+                        result_entry[key] = val
+                else:
+                    result_entry[key] = val
+
+            results.append(result_entry)
+
+        if count > 0:
+            print(f"    ... {count} total         ")
+
+    except Exception as e:
+        print(f"[-] Error executing custom LDAP query: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return results
 
 # Display functions
 def display_users(users):
@@ -1680,6 +1750,43 @@ def display_asreproastable(accounts):
     print('='*70)
     for account in accounts:
         print(f"  {account.get('sAMAccountName', 'N/A')}")
+
+def display_custom_query(results, max_display=20):
+    """Display custom query results in readable format"""
+    print(f"\n{'='*70}")
+    print(f"CUSTOM QUERY RESULTS (showing first {max_display} of {len(results)}):")
+    print('='*70)
+
+    for idx, entry in enumerate(results[:max_display], 1):
+        print(f"\n[{idx}] {entry.get('dn', 'N/A')}")
+
+        # Display all attributes except DN (already shown)
+        for key, val in entry.items():
+            if key == 'dn':
+                continue
+
+            # Format the value for display
+            if isinstance(val, list):
+                if len(val) > 5:
+                    # Show first 5 items for long lists
+                    val_str = ', '.join(str(v) for v in val[:5]) + f'... (+{len(val)-5} more)'
+                else:
+                    val_str = ', '.join(str(v) for v in val)
+            elif isinstance(val, bytes):
+                # Show hex for binary data
+                val_str = f"<binary: {len(val)} bytes>"
+            else:
+                val_str = str(val)
+
+            # Truncate very long values
+            if len(val_str) > 200:
+                val_str = val_str[:200] + '...'
+
+            print(f"  {key}: {val_str}")
+
+    if len(results) > max_display:
+        print(f"\n... and {len(results) - max_display} more results")
+        print(f"    (Use -o to save full results to file)")
 
 def save_output(data, output_dir, domain, output_format='legacy'):
     """
@@ -3379,6 +3486,17 @@ Modification Examples:
     enum_group.add_argument('--kerberoastable', action='store_true', help='Find Kerberoastable accounts (users with SPN)')
     enum_group.add_argument('--asreproast', action='store_true', help='Find AS-REP roastable accounts (no pre-auth)')
 
+    # Custom query options
+    custom_group = parser.add_argument_group('custom LDAP query options')
+    custom_group.add_argument('--custom-query', metavar='FILTER',
+                             help='Execute custom LDAP query with specified filter (e.g., "(objectClass=user)")')
+    custom_group.add_argument('--custom-attrs', metavar='ATTRS',
+                             help='Comma-separated list of attributes for custom query (default: all attributes)')
+    custom_group.add_argument('--custom-base', metavar='BASE_DN',
+                             help='Custom base DN for query (default: domain base DN)')
+    custom_group.add_argument('--custom-scope', choices=['BASE', 'LEVEL', 'SUBTREE'], default='SUBTREE',
+                             help='Search scope for custom query (default: SUBTREE)')
+
     # LDAP modification operations
     mod_group = parser.add_argument_group('LDAP modification operations')
     mod_group.add_argument('--add-user', metavar='USERNAME', help='Add a new user')
@@ -3405,8 +3523,11 @@ Modification Examples:
         args.set_password, args.set_rbcd, args.add_dns
     ])
 
-    # If no enumeration options specified and no modification, default to --all
-    if not is_modification and not any([args.all, args.domain_info, args.users, args.computers, args.groups,
+    # Check if custom query is requested
+    is_custom_query = bool(args.custom_query)
+
+    # If no enumeration options specified and no modification and no custom query, default to --all
+    if not is_modification and not is_custom_query and not any([args.all, args.domain_info, args.users, args.computers, args.groups,
                 args.trusts, args.gpos, args.ous, args.containers,
                 args.kerberoastable, args.asreproast]):
         args.all = True
@@ -3573,6 +3694,149 @@ Modification Examples:
 
         except Exception as e:
             print(f"[-] Error during modification: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+    # Handle custom LDAP query
+    if is_custom_query:
+        try:
+            # Format username for NTLM: DOMAIN\username
+            ntlm_user = f"{args.domain}\\{args.username}"
+
+            scheme = "ldaps" if args.ldaps else "ldap"
+            print(f"[*] Connecting to {scheme}://{args.host}:{port}")
+            print(f"[*] Using NTLM authentication as: {ntlm_user}")
+
+            # Create server
+            if args.ldaps:
+                from ldap3 import Tls
+                tls = Tls(
+                    validate=ssl.CERT_NONE,
+                    version=ssl.PROTOCOL_TLS_CLIENT,
+                    ciphers="ALL:@SECLEVEL=0",
+                )
+                server = Server(
+                    args.host,
+                    port=port,
+                    use_ssl=True,
+                    get_info=None,
+                    connect_timeout=30,
+                    tls=tls
+                )
+            else:
+                server = Server(
+                    args.host,
+                    port=port,
+                    use_ssl=False,
+                    get_info=None,
+                    connect_timeout=30
+                )
+
+            # Create connection with NTLM
+            conn = Connection(
+                server,
+                user=ntlm_user,
+                password=args.password,
+                authentication='NTLM',
+                receive_timeout=args.timeout,
+                auto_bind=False,
+                raise_exceptions=True,
+                channel_binding=args.ldap_channel_binding if args.ldaps else False,
+                session_security='ENCRYPT' if args.ldap_signing else None
+            )
+
+            print(f"[*] Binding to LDAP...")
+            conn.bind()
+
+            if not conn.bound:
+                print("[-] Failed to bind to LDAP")
+                return
+
+            print("[+] Successfully bound to LDAP server")
+
+            # Get or construct base DN
+            if args.custom_base:
+                base_dn = args.custom_base
+            elif args.base_dn:
+                base_dn = args.base_dn
+            else:
+                base_dn = get_base_dn(conn, args.domain)
+
+            if not base_dn:
+                print("[-] Could not determine base DN. Use --base-dn or --custom-base to specify.")
+                conn.unbind()
+                return
+
+            # Parse attributes if provided
+            attributes = None
+            if args.custom_attrs:
+                attributes = [attr.strip() for attr in args.custom_attrs.split(',')]
+
+            # Parse search scope
+            scope_map = {
+                'BASE': BASE,
+                'LEVEL': LEVEL,
+                'SUBTREE': SUBTREE
+            }
+            search_scope = scope_map.get(args.custom_scope, SUBTREE)
+
+            # Execute custom query
+            results = custom_ldap_query(
+                conn,
+                base_dn,
+                args.custom_query,
+                attributes=attributes,
+                search_scope=search_scope
+            )
+
+            # Display results
+            display_custom_query(results)
+
+            # Save results if output directory specified
+            if args.output:
+                import json
+                from pathlib import Path
+                from datetime import datetime, timezone
+
+                output_path = Path(args.output)
+                output_path.mkdir(parents=True, exist_ok=True)
+
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                filename = f"custom_query_{timestamp}.json"
+                filepath = output_path / filename
+
+                # Convert results to JSON-serializable format
+                json_results = []
+                for entry in results:
+                    json_entry = {}
+                    for key, val in entry.items():
+                        if isinstance(val, bytes):
+                            json_entry[key] = f"<binary: {len(val)} bytes>"
+                        elif isinstance(val, list):
+                            json_entry[key] = [str(v) for v in val]
+                        else:
+                            json_entry[key] = str(val)
+                    json_results.append(json_entry)
+
+                with open(filepath, 'w') as f:
+                    json.dump({
+                        'query_filter': args.custom_query,
+                        'base_dn': base_dn,
+                        'scope': args.custom_scope,
+                        'attributes': attributes or ['*'],
+                        'results': json_results
+                    }, f, indent=2)
+
+                print(f"\n[+] Results saved to: {filepath}")
+
+            conn.unbind()
+            print()
+            print("[+] Custom query completed")
+            return
+
+        except Exception as e:
+            print(f"[-] Error during custom query: {e}")
             import traceback
             traceback.print_exc()
             return
