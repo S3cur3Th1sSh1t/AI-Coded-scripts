@@ -1076,11 +1076,21 @@ def get_users(conn, base_dn):
                 user = {}
                 
                 # Basic attributes
-                for key in ['sAMAccountName', 'userPrincipalName', 'distinguishedName', 
-                           'description', 'displayName', 'mail', 'title', 'objectSid']:
+                for key in ['sAMAccountName', 'userPrincipalName', 'distinguishedName',
+                           'description', 'displayName', 'mail', 'title']:
                     if key in attrs:
                         val = attrs[key]
                         user[key] = val[0] if isinstance(val, list) and val else val
+
+                # objectSid needs special handling - convert bytes to string
+                if 'objectSid' in attrs:
+                    sid_val = attrs['objectSid']
+                    if isinstance(sid_val, list) and sid_val:
+                        sid_val = sid_val[0]
+                    if isinstance(sid_val, bytes):
+                        user['objectSid'] = sid_to_string(sid_val)
+                    else:
+                        user['objectSid'] = sid_val
                 
                 # Group memberships
                 if 'memberOf' in attrs:
@@ -1125,7 +1135,16 @@ def get_users(conn, base_dn):
                 # SID History (privilege escalation vector)
                 if 'sIDHistory' in attrs:
                     history = attrs['sIDHistory']
-                    user['sIDHistory'] = history if isinstance(history, list) else [history]
+                    if not isinstance(history, list):
+                        history = [history]
+                    # Convert bytes SIDs to strings
+                    converted_history = []
+                    for sid_item in history:
+                        if isinstance(sid_item, bytes):
+                            converted_history.append(sid_to_string(sid_item))
+                        else:
+                            converted_history.append(sid_item)
+                    user['sIDHistory'] = converted_history
                 
                 # Security descriptor for ACLs (convert to base64 for storage)
                 if 'nTSecurityDescriptor' in attrs:
@@ -1182,12 +1201,22 @@ def get_computers(conn, base_dn):
             
             attrs = entry.get('attributes', {})
             computer = {}
-            
-            for key in ['dNSHostName', 'sAMAccountName', 'distinguishedName', 
-                       'operatingSystem', 'operatingSystemVersion', 'objectSid']:
+
+            for key in ['dNSHostName', 'sAMAccountName', 'distinguishedName',
+                       'operatingSystem', 'operatingSystemVersion']:
                 if key in attrs:
                     val = attrs[key]
                     computer[key] = val[0] if isinstance(val, list) and val else val
+
+            # objectSid needs special handling - convert bytes to string
+            if 'objectSid' in attrs:
+                sid_val = attrs['objectSid']
+                if isinstance(sid_val, list) and sid_val:
+                    sid_val = sid_val[0]
+                if isinstance(sid_val, bytes):
+                    computer['objectSid'] = sid_to_string(sid_val)
+                else:
+                    computer['objectSid'] = sid_val
             
             if 'userAccountControl' in attrs:
                 uac = attrs['userAccountControl']
@@ -1248,11 +1277,21 @@ def get_groups(conn, base_dn):
             
             attrs = entry.get('attributes', {})
             group = {}
-            
-            for key in ['sAMAccountName', 'distinguishedName', 'description', 'objectSid']:
+
+            for key in ['sAMAccountName', 'distinguishedName', 'description']:
                 if key in attrs:
                     val = attrs[key]
                     group[key] = val[0] if isinstance(val, list) and val else val
+
+            # objectSid needs special handling - convert bytes to string
+            if 'objectSid' in attrs:
+                sid_val = attrs['objectSid']
+                if isinstance(sid_val, list) and sid_val:
+                    sid_val = sid_val[0]
+                if isinstance(sid_val, bytes):
+                    group['objectSid'] = sid_to_string(sid_val)
+                else:
+                    group['objectSid'] = sid_val
             
             if 'member' in attrs:
                 group['member'] = attrs['member'] if isinstance(attrs['member'], list) else [attrs['member']]
@@ -1360,11 +1399,21 @@ def get_gpos(conn, base_dn):
             
             attrs = entry.get('attributes', {})
             gpo = {}
-            
-            for key in ['displayName', 'name', 'gPCFileSysPath', 'distinguishedName', 'objectSid']:
+
+            for key in ['displayName', 'name', 'gPCFileSysPath', 'distinguishedName']:
                 if key in attrs:
                     val = attrs[key]
                     gpo[key] = val[0] if isinstance(val, list) and val else val
+
+            # objectSid needs special handling - convert bytes to string
+            if 'objectSid' in attrs:
+                sid_val = attrs['objectSid']
+                if isinstance(sid_val, list) and sid_val:
+                    sid_val = sid_val[0]
+                if isinstance(sid_val, bytes):
+                    gpo['objectSid'] = sid_to_string(sid_val)
+                else:
+                    gpo['objectSid'] = sid_val
             
             # Security descriptor for ACLs
             if 'nTSecurityDescriptor' in attrs:
@@ -1953,6 +2002,10 @@ def convert_to_bloodhound_legacy(data, domain, output_dir):
         def is_highvalue(sid):
             if not sid:
                 return False
+            # Handle both bytes and string SIDs
+            if isinstance(sid, bytes):
+                sid = sid_to_string(sid)
+            # Check for high-value group SIDs
             if sid.endswith("-512") or sid.endswith("-516") or sid.endswith("-519"):
                 return True
             if sid in highvalue_sids:
