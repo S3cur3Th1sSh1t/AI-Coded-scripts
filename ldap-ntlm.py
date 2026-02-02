@@ -127,7 +127,7 @@ CREDITS:
 """
 
 
-from ldap3 import Server, Connection, NTLM, SUBTREE, ALL_ATTRIBUTES, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
+from ldap3 import Server, Connection, NTLM, BASE, LEVEL, SUBTREE, ALL_ATTRIBUTES, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
 from ldap3.core.results import RESULT_SUCCESS
 from ldap3.protocol import rfc4511
 from ldap3.strategy.base import BaseStrategy
@@ -3741,9 +3741,7 @@ Modification Examples:
                 authentication='NTLM',
                 receive_timeout=args.timeout,
                 auto_bind=False,
-                raise_exceptions=True,
-                channel_binding=args.ldap_channel_binding if args.ldaps else False,
-                session_security='ENCRYPT' if args.ldap_signing else None
+                raise_exceptions=True
             )
 
             print(f"[*] Binding to LDAP...")
