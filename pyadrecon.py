@@ -1527,8 +1527,6 @@ class PyADRecon:
                     logon_age_days = (now - last_logon_dt).days
                     if logon_age_days > self.config.dormant_days:
                         dormant = True
-                    if logon_age_days > self.config.dormant_days:
-                        dormant = True
 
                 # Operating system
                 os_name = safe_str(get_attr(entry, 'operatingSystem', ''))
