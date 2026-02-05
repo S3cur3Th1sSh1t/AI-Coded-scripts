@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 PyADRecon - Python Active Directory Reconnaissance Tool
@@ -2006,6 +2007,11 @@ class PyADRecon:
             traceback.print_exc()
             return None
 
+    def close(self):
+        """Close LDAP connection."""
+        if self.conn:
+            self.conn.unbind()            
+
 
 def generate_excel_from_csv(csv_dir: str, output_file: str = None):
     """
@@ -2147,12 +2153,6 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         import traceback
         traceback.print_exc()
         return None
-
-    def close(self):
-        """Close LDAP connection."""
-        if self.conn:
-            self.conn.unbind()
-
 
 def main():
     parser = argparse.ArgumentParser(
