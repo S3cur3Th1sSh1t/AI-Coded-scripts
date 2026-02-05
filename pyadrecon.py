@@ -1905,98 +1905,99 @@ class PyADRecon:
         return csv_dir
 
     def export_xlsx(self, output_dir: str, domain_name: str = ""):
-        """Export results to Excel file."""
+        """Export results to Excel file (optimized for large datasets)."""
         if not OPENPYXL_AVAILABLE:
             logger.warning("[*] openpyxl not available - Excel export disabled")
             return None
 
-        logger.info("[*] Generating Excel Report...")
+        logger.info("[*] Generating Excel Report (optimized mode)...")
+        start_time = datetime.now()
 
         try:
-            wb = openpyxl.Workbook()
-            wb.remove(wb.active)  # Remove default sheet
+            # Use write_only mode for much faster performance
+            from openpyxl import Workbook
+            from openpyxl.cell import WriteOnlyCell
 
-            # Define styles
+            wb = Workbook(write_only=True)
+
+            # Define styles for headers
             header_font = Font(bold=True, color="FFFFFF")
             header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
-            header_alignment = Alignment(horizontal="center", vertical="center")
-            thin_border = Border(
-                left=Side(style='thin'),
-                right=Side(style='thin'),
-                top=Side(style='thin'),
-                bottom=Side(style='thin')
-            )
 
-            # Create Table of Contents sheet
-            toc_ws = wb.create_sheet("Table of Contents", 0)
-            toc_ws['A1'] = "PyADRecon Report"
-            toc_ws['A1'].font = Font(bold=True, size=16)
-            toc_ws['A2'] = f"Generated: {datetime.now()}"
-            toc_ws['A3'] = f"Domain: {domain_name or dn_to_fqdn(self.base_dn)}"
-
-            row = 5
+            # Create Table of Contents sheet first (small, use regular mode)
+            toc_data = [
+                ["PyADRecon Report"],
+                [f"Generated: {datetime.now()}"],
+                [f"Domain: {domain_name or dn_to_fqdn(self.base_dn)}"],
+                [""],
+                ["Sheet Name", "Record Count"],
+            ]
             for name in self.results.keys():
                 if self.results[name]:
-                    toc_ws.cell(row=row, column=1, value=name)
-                    toc_ws.cell(row=row, column=2, value=len(self.results[name]))
-                    row += 1
+                    toc_data.append([name, len(self.results[name])])
 
-            # Create sheets for each result set
+            toc_ws = wb.create_sheet("Table of Contents")
+            for row in toc_data:
+                toc_ws.append(row)
+
+            # Process each result set
+            total_sheets = len([k for k, v in self.results.items() if v])
+            current_sheet = 0
+
             for name, data in self.results.items():
                 if not data:
                     continue
 
+                current_sheet += 1
+                record_count = len(data)
+                logger.info(f"    [{current_sheet}/{total_sheets}] Writing {name} ({record_count:,} records)...")
+
                 ws = wb.create_sheet(name[:31])  # Excel sheet name limit
 
-                # Write headers
-                if data:
-                    headers = list(data[0].keys())
-                    for col, header in enumerate(headers, 1):
-                        cell = ws.cell(row=1, column=col, value=header)
-                        cell.font = header_font
-                        cell.fill = header_fill
-                        cell.alignment = header_alignment
-                        cell.border = thin_border
+                headers = list(data[0].keys())
 
-                    # Write data
-                    for row_idx, row_data in enumerate(data, 2):
-                        for col_idx, header in enumerate(headers, 1):
-                            value = row_data.get(header, '')
-                            # Handle ldap3 Attribute objects
-                            if hasattr(value, 'raw_values'):
-                                value = value.value
-                            # Convert to string if necessary
-                            if value is None:
-                                value = ''
-                            elif isinstance(value, (list, dict)):
-                                value = str(value)
-                            elif isinstance(value, bytes):
-                                value = value.decode('utf-8', errors='replace')
-                            elif not isinstance(value, (str, int, float, bool)):
-                                value = str(value)
-                            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                            cell.border = thin_border
+                # Write header row with styling
+                header_row = []
+                for header in headers:
+                    cell = WriteOnlyCell(ws, value=header)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    header_row.append(cell)
+                ws.append(header_row)
 
-                    # Auto-fit columns
-                    for col in ws.columns:
-                        max_length = 0
-                        column = col[0].column_letter
-                        for cell in col:
-                            try:
-                                if cell.value:
-                                    max_length = max(max_length, len(str(cell.value)))
-                            except:
-                                pass
-                        adjusted_width = min(max_length + 2, 50)
-                        ws.column_dimensions[column].width = adjusted_width
+                # Write data rows in batches for progress reporting
+                batch_size = 10000
+                for i, row_data in enumerate(data):
+                    row = []
+                    for header in headers:
+                        value = row_data.get(header, '')
+                        # Handle ldap3 Attribute objects
+                        if hasattr(value, 'raw_values'):
+                            value = value.value
+                        # Convert to safe types
+                        if value is None:
+                            value = ''
+                        elif isinstance(value, bytes):
+                            value = value.decode('utf-8', errors='replace')
+                        elif isinstance(value, (list, dict)):
+                            value = str(value)
+                        elif not isinstance(value, (str, int, float, bool)):
+                            value = str(value)
+                        row.append(value)
+                    ws.append(row)
 
-                    # Freeze header row
-                    ws.freeze_panes = 'A2'
+                    # Progress for large datasets
+                    if record_count > batch_size and (i + 1) % batch_size == 0:
+                        pct = ((i + 1) / record_count) * 100
+                        logger.info(f"        {i + 1:,}/{record_count:,} rows ({pct:.0f}%)")
 
             # Save workbook
             filename = os.path.join(output_dir, f"{domain_name or 'ADRecon'}-Report.xlsx")
+            logger.info(f"    Saving Excel file...")
             wb.save(filename)
-            logger.info(f"[+] Excel Report saved to: {filename}")
+
+            duration = datetime.now() - start_time
+            logger.info(f"[+] Excel Report saved to: {filename} (took {duration})")
             return filename
 
         except Exception as e:
@@ -2004,6 +2005,148 @@ class PyADRecon:
             import traceback
             traceback.print_exc()
             return None
+
+
+def generate_excel_from_csv(csv_dir: str, output_file: str = None):
+    """
+    Standalone function to generate Excel report from CSV files.
+    This is optimized for large datasets and can be run independently.
+
+    Args:
+        csv_dir: Path to directory containing CSV files
+        output_file: Output Excel file path (optional, defaults to same directory)
+    """
+    if not OPENPYXL_AVAILABLE:
+        logger.error("[!] openpyxl not available - install with: pip install openpyxl")
+        return None
+
+    if not os.path.isdir(csv_dir):
+        logger.error(f"[!] CSV directory not found: {csv_dir}")
+        return None
+
+    logger.info(f"[*] Generating Excel Report from CSV files in: {csv_dir}")
+    start_time = datetime.now()
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.cell import WriteOnlyCell
+
+        # Find all CSV files
+        csv_files = sorted([f for f in os.listdir(csv_dir) if f.endswith('.csv')])
+        if not csv_files:
+            logger.error(f"[!] No CSV files found in: {csv_dir}")
+            return None
+
+        logger.info(f"    Found {len(csv_files)} CSV files")
+
+        # Use write_only mode for performance
+        wb = Workbook(write_only=True)
+
+        # Define styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
+
+        # Build TOC data
+        toc_data = [
+            ["PyADRecon Report"],
+            [f"Generated: {datetime.now()}"],
+            [f"Source: {csv_dir}"],
+            [""],
+            ["Sheet Name", "Record Count"],
+        ]
+
+        # First pass - count records for TOC
+        file_counts = {}
+        for csv_file in csv_files:
+            csv_path = os.path.join(csv_dir, csv_file)
+            with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+                count = sum(1 for _ in f) - 1  # Subtract header
+                file_counts[csv_file] = max(0, count)
+            sheet_name = csv_file.replace('.csv', '')
+            toc_data.append([sheet_name, file_counts[csv_file]])
+
+        # Create TOC sheet
+        toc_ws = wb.create_sheet("Table of Contents")
+        for row in toc_data:
+            toc_ws.append(row)
+
+        # Process each CSV file
+        total_files = len(csv_files)
+        for idx, csv_file in enumerate(csv_files, 1):
+            sheet_name = csv_file.replace('.csv', '')[:31]  # Excel limit
+            record_count = file_counts[csv_file]
+
+            logger.info(f"    [{idx}/{total_files}] Processing {csv_file} ({record_count:,} records)...")
+
+            csv_path = os.path.join(csv_dir, csv_file)
+            ws = wb.create_sheet(sheet_name)
+
+            with open(csv_path, 'r', encoding='utf-8', errors='replace', newline='') as f:
+                reader = csv.reader(f)
+
+                # Write header with styling
+                try:
+                    headers = next(reader)
+                    header_row = []
+                    for header in headers:
+                        cell = WriteOnlyCell(ws, value=header)
+                        cell.font = header_font
+                        cell.fill = header_fill
+                        header_row.append(cell)
+                    ws.append(header_row)
+                except StopIteration:
+                    continue  # Empty file
+
+                # Write data rows
+                batch_size = 10000
+                row_num = 0
+                for row in reader:
+                    # Convert empty strings and handle encoding
+                    clean_row = []
+                    for val in row:
+                        if val == '':
+                            clean_row.append('')
+                        else:
+                            # Try to convert to number if possible
+                            try:
+                                if '.' in val:
+                                    clean_row.append(float(val))
+                                else:
+                                    clean_row.append(int(val))
+                            except ValueError:
+                                clean_row.append(val)
+                    ws.append(clean_row)
+                    row_num += 1
+
+                    # Progress for large files
+                    if record_count > batch_size and row_num % batch_size == 0:
+                        pct = (row_num / record_count) * 100
+                        logger.info(f"        {row_num:,}/{record_count:,} rows ({pct:.0f}%)")
+
+        # Determine output filename
+        if output_file:
+            filename = output_file
+        else:
+            # Put in parent directory of CSV-Files
+            parent_dir = os.path.dirname(csv_dir.rstrip('/'))
+            if os.path.basename(csv_dir) == 'CSV-Files':
+                filename = os.path.join(parent_dir, "ADRecon-Report.xlsx")
+            else:
+                filename = os.path.join(csv_dir, "ADRecon-Report.xlsx")
+
+        logger.info(f"    Saving Excel file...")
+        wb.save(filename)
+
+        duration = datetime.now() - start_time
+        logger.info(f"[+] Excel Report saved to: {filename}")
+        logger.info(f"[+] Total time: {duration}")
+        return filename
+
+    except Exception as e:
+        logger.error(f"Failed to create Excel report: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
     def close(self):
         """Close LDAP connection."""
@@ -2028,15 +2171,22 @@ Examples:
 
   # Output to specific directory
   %(prog)s -dc 192.168.1.1 -u admin -p pass -d DOMAIN.LOCAL -o /tmp/adrecon_output
+
+  # Generate Excel report from existing CSV files (standalone mode)
+  %(prog)s --generate-excel-from /path/to/CSV-Files -o report.xlsx
         """
     )
 
-    # Required arguments
-    parser.add_argument('-dc', '--domain-controller', required=True,
+    # Standalone Excel generation mode
+    parser.add_argument('--generate-excel-from', metavar='CSV_DIR',
+                       help='Generate Excel report from CSV directory (standalone mode, no AD connection needed)')
+
+    # Required arguments (not required if using --generate-excel-from)
+    parser.add_argument('-dc', '--domain-controller', default='',
                        help='Domain Controller IP or hostname')
-    parser.add_argument('-u', '--username', required=True,
+    parser.add_argument('-u', '--username', default='',
                        help='Username for authentication')
-    parser.add_argument('-p', '--password', required=True,
+    parser.add_argument('-p', '--password', default='',
                        help='Password for authentication')
 
     # Optional arguments
@@ -2071,6 +2221,30 @@ Examples:
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
+
+    # Handle standalone Excel generation mode
+    if args.generate_excel_from:
+        print(BANNER)
+        logger.info("Running in standalone Excel generation mode")
+
+        if not OPENPYXL_AVAILABLE:
+            print("[!] openpyxl library required: pip install openpyxl")
+            sys.exit(1)
+
+        csv_dir = args.generate_excel_from
+        output_file = args.output if args.output else None
+
+        result = generate_excel_from_csv(csv_dir, output_file)
+        if result:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
+    # Check required arguments for normal mode
+    if not args.domain_controller or not args.username or not args.password:
+        print("[!] Error: -dc, -u, and -p are required for AD reconnaissance mode")
+        print("[!] Use --generate-excel-from for standalone Excel generation from CSV files")
+        sys.exit(1)
 
     # Check for required library
     if not LDAP3_AVAILABLE:
