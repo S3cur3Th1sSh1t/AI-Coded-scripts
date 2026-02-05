@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 PyADRecon - Python Active Directory Reconnaissance Tool
