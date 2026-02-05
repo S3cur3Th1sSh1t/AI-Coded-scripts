@@ -3,7 +3,7 @@
 PyADRecon - Python Active Directory Reconnaissance Tool
 A Python port of ADRecon with NTLM and Kerberos authentication support.
 
-Author: Security Research
+Author: S3cur3Th1sSh1t, LRVT
 License: MIT
 """
 
@@ -184,6 +184,16 @@ def generalized_time_to_datetime(time_str: str) -> Optional[datetime]:
         return datetime.strptime(time_str, "%Y%m%d%H%M%S")
     except ValueError:
         return None
+
+
+def format_datetime(dt) -> str:
+    """Format datetime to match ADRecon output format (M/D/YYYY H:MM:SS AM/PM)."""
+    if dt is None:
+        return ""
+    # If it's already a datetime object from ldap3
+    if isinstance(dt, datetime):
+        return dt.strftime("%-m/%-d/%Y %-I:%M:%S %p")
+    return ""
 
 
 def _extract_ldap_value(attr):
@@ -521,7 +531,7 @@ class PyADRecon:
                 results.append({"Category": "NetBIOS", "Value": get_attr(entry, 'name', '')})
                 results.append({"Category": "Functional Level", "Value": f"{func_level}Domain"})
                 results.append({"Category": "DomainSID", "Value": self.domain_sid})
-                results.append({"Category": "Creation Date", "Value": str(get_attr(entry, 'whenCreated', ''))})
+                results.append({"Category": "Creation Date", "Value": format_datetime(get_attr(entry, 'whenCreated'))})
                 results.append({"Category": "ms-DS-MachineAccountQuota", "Value": str(get_attr(entry, 'ms-DS-MachineAccountQuota', ''))})
 
                 # Get RID info
@@ -576,7 +586,7 @@ class PyADRecon:
             )
             if laps_entries:
                 results.append({"Category": "LAPS", "Value": "Enabled"})
-                results.append({"Category": "LAPS Installed Date", "Value": str(get_attr(laps_entries[0], 'whenCreated', ''))})
+                results.append({"Category": "LAPS Installed Date", "Value": format_datetime(get_attr(laps_entries[0], 'whenCreated'))})
             else:
                 results.append({"Category": "LAPS", "Value": "Not Installed"})
 
@@ -626,8 +636,8 @@ class PyADRecon:
                     "Trust Direction": TRUST_DIRECTION.get(safe_int(trust_dir), "Unknown"),
                     "Trust Type": TRUST_TYPE.get(safe_int(trust_type), "Unknown"),
                     "Attributes": ", ".join(attrs_list),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -653,8 +663,8 @@ class PyADRecon:
                 results.append({
                     "Name": get_attr(entry, 'name', ''),
                     "Description": get_attr(entry, 'description', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -689,8 +699,8 @@ class PyADRecon:
                     "Site": site_name,
                     "Name": get_attr(entry, 'name', ''),
                     "Description": get_attr(entry, 'description', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -726,8 +736,8 @@ class PyADRecon:
                     "OS Version": safe_str(get_attr(entry, 'operatingSystemVersion', '')),
                     "OS Service Pack": safe_str(get_attr(entry, 'operatingSystemServicePack', '')),
                     "Is RODC": str(is_rodc),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 }
 
                 # Try to get IP address
@@ -885,32 +895,47 @@ class PyADRecon:
 
                 # Password last set
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes, not integers
+                pwd_last_set_dt = None
                 pwd_age_days = None
                 must_change_pwd = False
                 pwd_not_changed_max = False
-
-                if pwd_last_set_dt:
-                    pwd_age_days = (now - pwd_last_set_dt).days
-                    if pwd_age_days > self.config.password_age_days:
-                        pwd_not_changed_max = True
-                elif pwd_last_set_int == 0 and not uac_parsed.get('PasswordNeverExpires', False):
+                
+                if isinstance(pwd_last_set, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    pwd_last_set_dt = pwd_last_set.replace(tzinfo=None) if pwd_last_set.tzinfo else pwd_last_set
+                    # Check if pwdLastSet is 0 (1601-01-01 epoch) which means "must change password at logon"
+                    if pwd_last_set_dt.year == 1601:
+                        must_change_pwd = True
+                        pwd_last_set_dt = None  # Don't show the 1601 date
+                    else:
+                        pwd_age_days = (now - pwd_last_set_dt).days
+                        if pwd_age_days > self.config.password_age_days:
+                            pwd_not_changed_max = True
+                else:
+                    # If not a datetime, user must change password at next logon
                     must_change_pwd = True
 
                 # Last logon
                 last_logon = get_attr(entry, 'lastLogonTimestamp')
-                last_logon_int = safe_int(last_logon)
-                last_logon_dt = windows_timestamp_to_datetime(last_logon_int) if last_logon_int else None
+                # ldap3 returns datetime objects for these attributes, not integers
+                last_logon_dt = None
                 logon_age_days = None
                 never_logged_in = True
                 dormant = False
 
-                if last_logon_dt:
-                    never_logged_in = False
-                    logon_age_days = (now - last_logon_dt).days
-                    if logon_age_days > self.config.dormant_days:
-                        dormant = True
+                if isinstance(last_logon, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    last_logon_dt = last_logon.replace(tzinfo=None) if last_logon.tzinfo else last_logon
+                    # Check if lastLogonTimestamp is 0 (1601-01-01 epoch) which means never logged in
+                    if last_logon_dt.year == 1601:
+                        last_logon_dt = None
+                        never_logged_in = True
+                    else:
+                        never_logged_in = False
+                        logon_age_days = (now - last_logon_dt).days
+                        if logon_age_days > self.config.dormant_days:
+                            dormant = True
 
                 # Account expiration
                 acc_expires = get_attr(entry, 'accountExpires')
@@ -962,13 +987,13 @@ class PyADRecon:
                     "Smartcard Logon Required": uac_parsed.get('SmartcardRequired', False),
                     "Delegation Permitted": not uac_parsed.get('NotDelegated', False),
                     "Kerberos DES Only": uac_parsed.get('UseDESKeyOnly', False),
-                    "Kerberos RC4": kerb_enc.get('RC4', ''),
-                    "Kerberos AES-128bit": kerb_enc.get('AES128', ''),
-                    "Kerberos AES-256bit": kerb_enc.get('AES256', ''),
+                    "Kerberos RC4": kerb_enc.get('RC4', '') if kerb_enc.get('RC4') else '',
+                    "Kerberos AES-128bit": kerb_enc.get('AES128', '') if kerb_enc.get('AES128') else '',
+                    "Kerberos AES-256bit": kerb_enc.get('AES256', '') if kerb_enc.get('AES256') else '',
                     "Does Not Require Pre Auth": uac_parsed.get('DoesNotRequirePreAuth', False),
                     "Never Logged in": never_logged_in,
-                    "Logon Age (days)": logon_age_days,
-                    "Password Age (days)": pwd_age_days,
+                    "Logon Age (days)": logon_age_days if logon_age_days is not None else "",
+                    "Password Age (days)": pwd_age_days if pwd_age_days is not None else "",
                     f"Dormant (> {self.config.dormant_days} days)": dormant,
                     f"Password Age (> {self.config.password_age_days} days)": pwd_not_changed_max,
                     "Account Locked Out": uac_parsed.get('AccountLockedOut', False),
@@ -989,10 +1014,10 @@ class PyADRecon:
                     "Company": get_attr(entry, 'company', ''),
                     "Manager": get_attr(entry, 'manager', ''),
                     "Info": get_attr(entry, 'info', ''),
-                    "Last Logon Date": str(last_logon_dt) if last_logon_dt else "",
-                    "Password LastSet": str(pwd_last_set_dt) if pwd_last_set_dt else "",
-                    "Account Expiration Date": str(acc_expires_dt) if acc_expires_dt else "",
-                    "Account Expiration (days)": acc_expires_days,
+                    "Last Logon Date": format_datetime(last_logon_dt),
+                    "Password LastSet": format_datetime(pwd_last_set_dt),
+                    "Account Expiration Date": format_datetime(acc_expires_dt),
+                    "Account Expiration (days)": acc_expires_days if acc_expires_days is not None else "",
                     "Mobile": get_attr(entry, 'mobile', ''),
                     "Email": get_attr(entry, 'mail', ''),
                     "HomeDirectory": get_attr(entry, 'homeDirectory', ''),
@@ -1003,8 +1028,8 @@ class PyADRecon:
                     "Middle Name": get_attr(entry, 'middleName', ''),
                     "Last Name": get_attr(entry, 'sn', ''),
                     "Country": get_attr(entry, 'c', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                     "CanonicalName": get_attr(entry, 'canonicalName', ''),
                 })
@@ -1042,8 +1067,11 @@ class PyADRecon:
                 uac_parsed = parse_uac(uac)
 
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes
+                pwd_last_set_dt = None
+                if isinstance(pwd_last_set, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    pwd_last_set_dt = pwd_last_set.replace(tzinfo=None) if pwd_last_set.tzinfo else pwd_last_set
 
                 # Get group memberships
                 member_of = get_attr_list(entry, 'memberOf')
@@ -1064,7 +1092,7 @@ class PyADRecon:
                         "Enabled": uac_parsed.get('Enabled', ''),
                         "Service": service,
                         "Host": host,
-                        "Password Last Set": str(pwd_last_set_dt) if pwd_last_set_dt else "",
+                        "Password Last Set": format_datetime(pwd_last_set_dt),
                         "Description": get_attr(entry, 'description', ''),
                         "Primary GroupID": get_attr(entry, 'primaryGroupID', ''),
                         "Memberof": ", ".join(groups),
@@ -1130,8 +1158,8 @@ class PyADRecon:
                     "ManagedBy": managed_by,
                     "SID": sid_to_string(get_attr(entry, 'objectSid')),
                     "SIDHistory": sid_history_str,
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                     "CanonicalName": get_attr(entry, 'canonicalName', ''),
                 })
@@ -1200,8 +1228,8 @@ class PyADRecon:
                     "Name": get_attr(entry, 'name', ''),
                     "Description": get_attr(entry, 'description', ''),
                     "gPLink": gp_link,
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                 })
 
@@ -1239,8 +1267,8 @@ class PyADRecon:
                     "User Settings Disabled": user_disabled,
                     "Computer Settings Disabled": computer_disabled,
                     "GPCFileSysPath": get_attr(entry, 'gPCFileSysPath', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                 })
 
@@ -1347,8 +1375,8 @@ class PyADRecon:
                     for entry in entries:
                         results.append({
                             "Name": get_attr(entry, 'name', ''),
-                            "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                            "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                            "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                            "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                             "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                         })
                 except Exception:
@@ -1388,8 +1416,8 @@ class PyADRecon:
                             "Zone": zone.get('Name', ''),
                             "Name": get_attr(entry, 'name', ''),
                             "Tombstoned": str(get_attr(entry, 'dNSTombstoned', '')),
-                            "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                            "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                            "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                            "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                         })
                 except Exception:
                     pass
@@ -1425,8 +1453,8 @@ class PyADRecon:
                     "Driver Version": get_attr(entry, 'driverVersion', ''),
                     "UNC Name": get_attr(entry, 'uNCName', ''),
                     "URL": get_attr(entry, 'url', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -1466,8 +1494,14 @@ class PyADRecon:
 
                 # Password last set
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes
+                pwd_last_set_dt = None
+                if isinstance(pwd_last_set, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    pwd_last_set_dt = pwd_last_set.replace(tzinfo=None) if pwd_last_set.tzinfo else pwd_last_set
+                    # Check if pwdLastSet is 0 (1601-01-01 epoch) which means password never set
+                    if pwd_last_set_dt.year == 1601:
+                        pwd_last_set_dt = None
                 pwd_age_days = None
                 pwd_not_changed_max = False
 
@@ -1478,13 +1512,21 @@ class PyADRecon:
 
                 # Last logon
                 last_logon = get_attr(entry, 'lastLogonTimestamp')
-                last_logon_int = safe_int(last_logon)
-                last_logon_dt = windows_timestamp_to_datetime(last_logon_int) if last_logon_int else None
+                # ldap3 returns datetime objects for these attributes
+                last_logon_dt = None
+                if isinstance(last_logon, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    last_logon_dt = last_logon.replace(tzinfo=None) if last_logon.tzinfo else last_logon
+                    # Check if lastLogonTimestamp is 0 (1601-01-01 epoch) which means never logged in
+                    if last_logon_dt.year == 1601:
+                        last_logon_dt = None
                 logon_age_days = None
                 dormant = False
 
                 if last_logon_dt:
                     logon_age_days = (now - last_logon_dt).days
+                    if logon_age_days > self.config.dormant_days:
+                        dormant = True
                     if logon_age_days > self.config.dormant_days:
                         dormant = True
 
@@ -1539,17 +1581,17 @@ class PyADRecon:
                     "Delegation Type": delegation_type or "",
                     "Delegation Protocol": delegation_protocol or "",
                     "Delegation Services": delegation_services or "",
-                    "Kerberos RC4": kerb_enc.get('RC4', ''),
-                    "Kerberos AES-128bit": kerb_enc.get('AES128', ''),
-                    "Kerberos AES-256bit": kerb_enc.get('AES256', ''),
+                    "Kerberos RC4": kerb_enc.get('RC4', '') if kerb_enc.get('RC4') else '',
+                    "Kerberos AES-128bit": kerb_enc.get('AES128', '') if kerb_enc.get('AES128') else '',
+                    "Kerberos AES-256bit": kerb_enc.get('AES256', '') if kerb_enc.get('AES256') else '',
                     "Primary GroupID": get_attr(entry, 'primaryGroupID', ''),
                     "SID": sid_to_string(get_attr(entry, 'objectSid')),
                     "SIDHistory": sid_history_str,
                     "Creator SID": creator_sid_str,
-                    "Last Logon Date": str(last_logon_dt) if last_logon_dt else "",
-                    "Password LastSet": str(pwd_last_set_dt) if pwd_last_set_dt else "",
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "Last Logon Date": format_datetime(last_logon_dt),
+                    "Password LastSet": format_datetime(pwd_last_set_dt),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                 })
 
@@ -1677,7 +1719,7 @@ class PyADRecon:
                     "Recovery Password": get_attr(entry, 'msFVE-RecoveryPassword', ''),
                     "Recovery GUID": get_attr(entry, 'msFVE-RecoveryGuid', ''),
                     "Volume GUID": get_attr(entry, 'msFVE-VolumeGuid', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
                 })
 
         except Exception as e:
@@ -1749,8 +1791,8 @@ class PyADRecon:
                 results.append({
                     "ObjectClass": obj_class,
                     "Name": get_attr(entry, 'name', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                 })
 
@@ -2006,6 +2048,11 @@ class PyADRecon:
             traceback.print_exc()
             return None
 
+    def close(self):
+        """Close LDAP connection."""
+        if self.conn:
+            self.conn.unbind()            
+
 
 def generate_excel_from_csv(csv_dir: str, output_file: str = None):
     """
@@ -2147,12 +2194,6 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         import traceback
         traceback.print_exc()
         return None
-
-    def close(self):
-        """Close LDAP connection."""
-        if self.conn:
-            self.conn.unbind()
-
 
 def main():
     parser = argparse.ArgumentParser(
