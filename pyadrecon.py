@@ -3,7 +3,7 @@
 PyADRecon - Python Active Directory Reconnaissance Tool
 A Python port of ADRecon with NTLM and Kerberos authentication support.
 
-Author: S3cur3Th1sSh1t, LRVT
+Author: LRVT - https://github.com/l4rm4nd
 License: MIT
 """
 
@@ -776,35 +776,65 @@ class PyADRecon:
                 entry = entries[0]
 
                 # Convert password age from 100-nanosecond intervals to days
+                # Note: ldap3 automatically converts these to timedelta objects
                 max_pwd_age = get_attr(entry, 'maxPwdAge')
                 min_pwd_age = get_attr(entry, 'minPwdAge')
                 lockout_duration = get_attr(entry, 'lockoutDuration')
                 lockout_window = get_attr(entry, 'lockoutObservationWindow')
 
                 def convert_interval_to_days(interval):
+                    """Convert AD time interval to days (handles both timedelta and raw values)."""
                     if interval is None:
                         return "Not Set"
                     try:
-                        # Negative value in 100-nanosecond intervals
-                        interval = abs(safe_int(interval))
-                        if interval == 0:
+                        # ldap3 returns timedelta objects for these attributes
+                        if isinstance(interval, timedelta):
+                            days = interval.days
+                            return days if days > 0 else "Not Set"
+                        
+                        # Fallback for raw integer values (100-nanosecond units)
+                        if isinstance(interval, str):
+                            interval_val = int(interval)
+                        else:
+                            interval_val = int(interval)
+                        
+                        # Check for 0 or positive values that indicate "never expires"
+                        if interval_val == 0 or interval_val > 0:
                             return "Not Set"
-                        days = interval / (10000000 * 60 * 60 * 24)
-                        return f"{days:.2f} days"
-                    except:
-                        return str(interval)
+                        
+                        # AD stores as negative value in 100-nanosecond intervals
+                        days = abs(interval_val) / (10000000 * 60 * 60 * 24)
+                        return int(round(days))
+                    except Exception as e:
+                        logger.debug(f"Error converting interval to days: {interval}, error: {e}")
+                        return "Not Set"
 
                 def convert_interval_to_minutes(interval):
+                    """Convert AD time interval to minutes (handles both timedelta and raw values)."""
                     if interval is None:
                         return "Not Set"
                     try:
-                        interval = abs(safe_int(interval))
-                        if interval == 0:
+                        # ldap3 returns timedelta objects for these attributes
+                        if isinstance(interval, timedelta):
+                            minutes = int(interval.total_seconds() / 60)
+                            return minutes if minutes > 0 else "Not Set"
+                        
+                        # Fallback for raw integer values (100-nanosecond units)
+                        if isinstance(interval, str):
+                            interval_val = int(interval)
+                        else:
+                            interval_val = int(interval)
+                        
+                        # Check for 0 or positive values
+                        if interval_val == 0 or interval_val > 0:
                             return "Not Set"
-                        minutes = interval / (10000000 * 60)
-                        return f"{minutes:.0f} minutes"
-                    except:
-                        return str(interval)
+                        
+                        # AD stores as negative value in 100-nanosecond intervals
+                        minutes = abs(interval_val) / (10000000 * 60)
+                        return int(round(minutes))
+                    except Exception as e:
+                        logger.debug(f"Error converting interval to minutes: {interval}, error: {e}")
+                        return "Not Set"
 
                 pwd_props = get_attr(entry, 'pwdProperties', 0)
                 pwd_props = safe_int(pwd_props)
@@ -1964,6 +1994,9 @@ class PyADRecon:
             header_font = Font(bold=True, color="FFFFFF")
             header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
 
+            # Track column widths for auto-sizing later
+            column_widths = {}
+
             # Create Table of Contents sheet first (small, use regular mode)
             toc_data = [
                 ["PyADRecon Report"],
@@ -1993,8 +2026,15 @@ class PyADRecon:
                 logger.info(f"    [{current_sheet}/{total_sheets}] Writing {name} ({record_count:,} records)...")
 
                 ws = wb.create_sheet(name[:31])  # Excel sheet name limit
+                sheet_name = name[:31]
 
                 headers = list(data[0].keys())
+
+                # Initialize column width tracking for this sheet
+                column_widths[sheet_name] = {}
+                for idx, header in enumerate(headers):
+                    # Start with header length
+                    column_widths[sheet_name][idx] = len(str(header))
 
                 # Write header row with styling
                 header_row = []
@@ -2007,9 +2047,11 @@ class PyADRecon:
 
                 # Write data rows in batches for progress reporting
                 batch_size = 10000
+                max_sample_rows = 1000  # Sample first N rows for width calculation
+                
                 for i, row_data in enumerate(data):
                     row = []
-                    for header in headers:
+                    for col_idx, header in enumerate(headers):
                         value = row_data.get(header, '')
                         # Handle ldap3 Attribute objects
                         if hasattr(value, 'raw_values'):
@@ -2023,6 +2065,13 @@ class PyADRecon:
                             value = str(value)
                         elif not isinstance(value, (str, int, float, bool)):
                             value = str(value)
+                        
+                        # Track column width (sample first N rows to avoid performance hit)
+                        if i < max_sample_rows:
+                            val_len = len(str(value))
+                            if val_len > column_widths[sheet_name][col_idx]:
+                                column_widths[sheet_name][col_idx] = val_len
+                        
                         row.append(value)
                     ws.append(row)
 
@@ -2035,6 +2084,42 @@ class PyADRecon:
             filename = os.path.join(output_dir, f"{domain_name or 'ADRecon'}-Report.xlsx")
             logger.info(f"    Saving Excel file...")
             wb.save(filename)
+
+            # Reopen in edit mode to set column widths (can't do this in write_only mode)
+            logger.info(f"    Auto-sizing columns...")
+            from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
+            
+            wb = load_workbook(filename)
+            
+            # Apply column widths to each sheet
+            for sheet_name, widths in column_widths.items():
+                if sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    for col_idx, width in widths.items():
+                        # Add some padding and cap at reasonable max
+                        # Excel column width units are weird, so we adjust
+                        adjusted_width = min(width + 2, 100)
+                        column_letter = get_column_letter(col_idx + 1)
+                        ws.column_dimensions[column_letter].width = adjusted_width
+            
+            # Also auto-size Table of Contents
+            if "Table of Contents" in wb.sheetnames:
+                toc_ws = wb["Table of Contents"]
+                for column in toc_ws.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if cell.value:
+                                max_length = max(max_length, len(str(cell.value)))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 100)
+                    toc_ws.column_dimensions[column_letter].width = adjusted_width
+            
+            wb.save(filename)
+            wb.close()
 
             duration = datetime.now() - start_time
             logger.info(f"[+] Excel Report saved to: {filename} (took {duration})")
