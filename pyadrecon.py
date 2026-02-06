@@ -3,7 +3,7 @@
 PyADRecon - Python Active Directory Reconnaissance Tool
 A Python port of ADRecon with NTLM and Kerberos authentication support.
 
-Author: Security Research
+Author: Claude Code from ShitSecure + Improvements from LRVT's Claude code - https://github.com/l4rm4nd - https://x.com/LRVT7/status/2019516346497958286
 License: MIT
 """
 
@@ -16,7 +16,7 @@ import struct
 import ssl
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,13 +28,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 LDAP3_AVAILABLE = False
 # Default values if ldap3 not available (for --help to work)
 SUBTREE = 2
+BASE = 0
 ALL_ATTRIBUTES = '*'
 LDAPException = Exception
 LDAPBindError = Exception
 
 try:
     import ldap3
-    from ldap3 import Server, Connection, ALL, NTLM, KERBEROS, SASL, SUBTREE, ALL_ATTRIBUTES
+    from ldap3 import Server, Connection, ALL, NTLM, KERBEROS, SASL, SUBTREE, BASE, ALL_ATTRIBUTES
     from ldap3.core.exceptions import LDAPException, LDAPBindError
     from ldap3.utils.conv import escape_filter_chars
     LDAP3_AVAILABLE = True
@@ -52,12 +53,11 @@ try:
     IMPACKET_AVAILABLE = True
 except ImportError:
     IMPACKET_AVAILABLE = False
-    print("[*] impacket not available - Kerberoast and SMB features disabled")
+    print("[*] impacket not available - SMB features disabled")
 
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils.dataframe import dataframe_to_rows
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
@@ -65,12 +65,14 @@ except ImportError:
 
 
 # Constants
-VERSION = "1.0.0"
+VERSION = "v0.2.8"  # Automatically updated by CI/CD pipeline during release
 BANNER = f"""
-╔═══════════════════════════════════════════════════════════╗
-║  PyADRecon v{VERSION} - Python AD Reconnaissance Tool      ║
-║  A Python implementation inspired by ADRecon              ║
-╚═══════════════════════════════════════════════════════════╝
+╔═════════════════════════════════════════════════════════
+║  PyADRecon {VERSION} - Python AD Reconnaissance Tool      
+║  A Python implementation inspired by ADRecon
+║  -------------------------------------------------------
+║  Author: LRVT - https://github.com/l4rm4nd/PyADRecon              
+╚═════════════════════════════════════════════════════════
 """
 
 # AD Constants
@@ -184,6 +186,20 @@ def generalized_time_to_datetime(time_str: str) -> Optional[datetime]:
         return datetime.strptime(time_str, "%Y%m%d%H%M%S")
     except ValueError:
         return None
+
+
+def format_datetime(dt) -> str:
+    """Format datetime in UTC (M/D/YYYY H:MM:SS AM/PM).
+    All timestamps are displayed in UTC for consistency and timezone independence.
+    ldap3 returns datetime objects in UTC, which we format as-is.
+    """
+    if dt is None:
+        return ""
+    # If it's already a datetime object from ldap3
+    if isinstance(dt, datetime):
+        # Format as-is in UTC, don't convert timezone
+        return dt.strftime("%-m/%-d/%Y %-I:%M:%S %p")
+    return ""
 
 
 def _extract_ldap_value(attr):
@@ -338,7 +354,7 @@ class ADReconConfig:
     page_size: int = 500
     threads: int = 10
     dormant_days: int = 90
-    password_age_days: int = 30
+    password_age_days: int = 180
     output_dir: str = ""
     only_enabled: bool = False
 
@@ -366,8 +382,6 @@ class ADReconConfig:
     collect_computer_spns: bool = True
     collect_laps: bool = True
     collect_bitlocker: bool = True
-    collect_kerberoast: bool = False
-    collect_acls: bool = False
 
 
 class PyADRecon:
@@ -384,59 +398,79 @@ class PyADRecon:
         self.start_time: datetime = datetime.now()
 
     def connect(self) -> bool:
-        """Establish LDAP connection."""
-        try:
-            port = 636 if self.config.use_ssl else self.config.port
-            server = Server(
-                self.config.domain_controller,
-                port=port,
-                use_ssl=self.config.use_ssl,
-                get_info=ALL
-            )
-
-            if self.config.auth_method.lower() == 'kerberos':
-                logger.info("Connecting using Kerberos authentication...")
-                self.conn = Connection(
-                    server,
-                    user=self.config.username,
-                    password=self.config.password,
-                    authentication=SASL,
-                    sasl_mechanism=KERBEROS,
-                    auto_bind=True
-                )
-            else:
-                # NTLM authentication
-                logger.info("Connecting using NTLM authentication...")
-                user = self.config.username
-                if '\\' not in user and '@' not in user:
-                    if self.config.domain:
-                        user = f"{self.config.domain}\\{user}"
-
-                self.conn = Connection(
-                    server,
-                    user=user,
-                    password=self.config.password,
-                    authentication=NTLM,
-                    auto_bind=True
+        """Establish LDAP connection. Try LDAPS first, fall back to LDAP if it fails."""
+        # Determine which protocols to try
+        protocols_to_try = []
+        
+        if self.config.use_ssl:
+            # User explicitly requested SSL only
+            protocols_to_try = [(True, 636)]
+        else:
+            # Try LDAPS first, then fall back to LDAP
+            protocols_to_try = [(True, 636), (False, self.config.port)]
+        
+        last_error = None
+        
+        for use_ssl, port in protocols_to_try:
+            try:
+                protocol = "LDAPS" if use_ssl else "LDAP"
+                logger.info(f"Attempting connection via {protocol} on port {port}...")
+                
+                server = Server(
+                    self.config.domain_controller,
+                    port=port,
+                    use_ssl=use_ssl,
+                    get_info=ALL
                 )
 
-            if self.conn.bound:
-                logger.info("LDAP bind successful")
-                self._get_root_dse()
-                return True
-            else:
-                logger.error(f"LDAP bind failed: {self.conn.result}")
-                return False
+                if self.config.auth_method.lower() == 'kerberos':
+                    logger.info("Using Kerberos authentication...")
+                    self.conn = Connection(
+                        server,
+                        user=self.config.username,
+                        password=self.config.password,
+                        authentication=SASL,
+                        sasl_mechanism=KERBEROS,
+                        auto_bind=True
+                    )
+                else:
+                    # NTLM authentication
+                    logger.info("Using NTLM authentication...")
+                    user = self.config.username
+                    if '\\' not in user and '@' not in user:
+                        if self.config.domain:
+                            user = f"{self.config.domain}\\{user}"
 
-        except LDAPBindError as e:
-            logger.error(f"LDAP bind error: {e}")
-            return False
-        except LDAPException as e:
-            logger.error(f"LDAP error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            return False
+                    self.conn = Connection(
+                        server,
+                        user=user,
+                        password=self.config.password,
+                        authentication=NTLM,
+                        auto_bind=True
+                    )
+
+                if self.conn.bound:
+                    logger.info(f"Successfully connected via {protocol} on port {port}")
+                    self._get_root_dse()
+                    return True
+                else:
+                    logger.warning(f"{protocol} bind failed: {self.conn.result}")
+                    last_error = self.conn.result
+
+            except (LDAPBindError, LDAPException) as e:
+                logger.warning(f"{protocol} connection failed: {e}")
+                last_error = e
+                # Continue to next protocol
+                continue
+            except Exception as e:
+                logger.warning(f"{protocol} connection error: {e}")
+                last_error = e
+                # Continue to next protocol
+                continue
+        
+        # All protocols failed
+        logger.error(f"Failed to connect via all protocols. Last error: {last_error}")
+        return False
 
     def _get_root_dse(self):
         """Get root DSE information."""
@@ -521,7 +555,7 @@ class PyADRecon:
                 results.append({"Category": "NetBIOS", "Value": get_attr(entry, 'name', '')})
                 results.append({"Category": "Functional Level", "Value": f"{func_level}Domain"})
                 results.append({"Category": "DomainSID", "Value": self.domain_sid})
-                results.append({"Category": "Creation Date", "Value": str(get_attr(entry, 'whenCreated', ''))})
+                results.append({"Category": "Creation Date", "Value": format_datetime(get_attr(entry, 'whenCreated'))})
                 results.append({"Category": "ms-DS-MachineAccountQuota", "Value": str(get_attr(entry, 'ms-DS-MachineAccountQuota', ''))})
 
                 # Get RID info
@@ -560,13 +594,158 @@ class PyADRecon:
                 ['*']
             )
 
+            forest_name = dn_to_fqdn(self.base_dn)
+            forest_fl = 0
+            
             if entries:
                 entry = entries[0]
                 forest_fl = get_attr(entry, 'msDS-Behavior-Version', 0)
                 func_level = DOMAIN_FUNCTIONAL_LEVELS.get(safe_int(forest_fl), "Unknown")
 
-                results.append({"Category": "Name", "Value": dn_to_fqdn(self.base_dn)})
+                results.append({"Category": "Name", "Value": forest_name})
                 results.append({"Category": "Functional Level", "Value": f"{func_level}Forest"})
+
+            # Get FSMO role holders (we'll get these from Domain Controllers collection)
+            # Domain Naming Master
+            try:
+                naming_entries = self.search(f"CN=Partitions,{self.config_dn}", "(objectClass=crossRefContainer)", ['fSMORoleOwner'])
+                if naming_entries:
+                    naming_owner = get_attr(naming_entries[0], 'fSMORoleOwner', '')
+                    if naming_owner:
+                        # Extract DC name from DN
+                        parts = str(naming_owner).split(',')
+                        if len(parts) > 1:
+                            dc_name = parts[1].replace('CN=', '')
+                            results.append({"Category": "Domain Naming Master", "Value": f"{dc_name.lower()}.{forest_name}"})
+            except:
+                pass
+            
+            # Schema Master
+            try:
+                schema_entries = self.search(self.schema_dn, "(objectClass=dMD)", ['fSMORoleOwner'])
+                if schema_entries:
+                    schema_owner = get_attr(schema_entries[0], 'fSMORoleOwner', '')
+                    if schema_owner:
+                        parts = str(schema_owner).split(',')
+                        if len(parts) > 1:
+                            dc_name = parts[1].replace('CN=', '')
+                            results.append({"Category": "Schema Master", "Value": f"{dc_name.lower()}.{forest_name}"})
+            except:
+                pass
+
+            # RootDomain
+            results.append({"Category": "RootDomain", "Value": forest_name})
+
+            # Domain Count - count cross-ref objects
+            try:
+                domain_entries = self.search(
+                    f"CN=Partitions,{self.config_dn}",
+                    "(&(objectClass=crossRef)(systemFlags:1.2.840.113556.1.4.803:=3))",
+                    ['nCName']
+                )
+                results.append({"Category": "Domain Count", "Value": str(len(domain_entries))})
+            except:
+                results.append({"Category": "Domain Count", "Value": "1"})
+
+            # Site Count
+            try:
+                site_entries = self.search(
+                    f"CN=Sites,{self.config_dn}",
+                    "(objectCategory=site)",
+                    ['name']
+                )
+                results.append({"Category": "Site Count", "Value": str(len(site_entries))})
+            except:
+                results.append({"Category": "Site Count", "Value": "0"})
+
+            # Global Catalog Count
+            try:
+                gc_entries = self.search(
+                    f"CN=Sites,{self.config_dn}",
+                    "(&(objectCategory=nTDSDSA)(options:1.2.840.113556.1.4.803:=1))",
+                    ['distinguishedName']
+                )
+                results.append({"Category": "Global Catalog Count", "Value": str(len(gc_entries))})
+            except:
+                results.append({"Category": "Global Catalog Count", "Value": "0"})
+
+            # Domain (same as forest root)
+            results.append({"Category": "Domain", "Value": forest_name})
+
+            # Site - get first site
+            try:
+                site_entries = self.search(
+                    f"CN=Sites,{self.config_dn}",
+                    "(objectCategory=site)",
+                    ['name']
+                )
+                if site_entries:
+                    results.append({"Category": "Site", "Value": get_attr(site_entries[0], 'name', '')})
+            except:
+                pass
+
+            # GlobalCatalog - get first GC server
+            try:
+                dc_entries = self.search(
+                    self.base_dn,
+                    "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))",
+                    ['dNSHostName']
+                )
+                if dc_entries:
+                    results.append({"Category": "GlobalCatalog", "Value": get_attr(dc_entries[0], 'dNSHostName', '')})
+            except:
+                pass
+
+            # Tombstone Lifetime
+            try:
+                dir_service_entries = self.search(
+                    f"CN=Directory Service,CN=Windows NT,CN=Services,{self.config_dn}",
+                    "(objectClass=*)",
+                    ['tombstoneLifetime']
+                )
+                if dir_service_entries:
+                    tombstone = get_attr(dir_service_entries[0], 'tombstoneLifetime', 180)
+                    results.append({"Category": "Tombstone Lifetime", "Value": str(tombstone)})
+                else:
+                    results.append({"Category": "Tombstone Lifetime", "Value": "180"})
+            except:
+                results.append({"Category": "Tombstone Lifetime", "Value": "180"})
+
+            # Recycle Bin (2008 R2 onwards) - check if msDS-EnabledFeature exists
+            try:
+                recycle_entries = self.search(
+                    f"CN=Partitions,{self.config_dn}",
+                    "(objectClass=crossRefContainer)",
+                    ['msDS-EnabledFeature']
+                )
+                recycle_enabled = False
+                if recycle_entries:
+                    enabled_features = get_attr_list(recycle_entries[0], 'msDS-EnabledFeature')
+                    for feature in enabled_features:
+                        if 'Recycle Bin Feature' in str(feature):
+                            recycle_enabled = True
+                            break
+                results.append({"Category": "Recycle Bin (2008 R2 onwards)", "Value": "Enabled" if recycle_enabled else "Disabled"})
+            except:
+                results.append({"Category": "Recycle Bin (2008 R2 onwards)", "Value": "Disabled"})
+
+            # Privileged Access Management (2016 onwards)
+            try:
+                pam_entries = self.search(
+                    f"CN=Partitions,{self.config_dn}",
+                    "(objectClass=crossRefContainer)",
+                    ['msDS-EnabledFeature']
+                )
+                pam_enabled = False
+                if pam_entries:
+                    enabled_features = get_attr_list(pam_entries[0], 'msDS-EnabledFeature')
+                    for feature in enabled_features:
+                        if 'Privileged Access Management' in str(feature) or 'PAM' in str(feature):
+                            pam_enabled = True
+                            break
+                results.append({"Category": "Privileged Access Management (2016 onwards)", "Value": "Enabled" if pam_enabled else "Disabled"})
+            except:
+                results.append({"Category": "Privileged Access Management (2016 onwards)", "Value": "Disabled"})
 
             # Check for LAPS
             laps_entries = self.search(
@@ -576,7 +755,7 @@ class PyADRecon:
             )
             if laps_entries:
                 results.append({"Category": "LAPS", "Value": "Enabled"})
-                results.append({"Category": "LAPS Installed Date", "Value": str(get_attr(laps_entries[0], 'whenCreated', ''))})
+                results.append({"Category": "LAPS Installed Date", "Value": format_datetime(get_attr(laps_entries[0], 'whenCreated'))})
             else:
                 results.append({"Category": "LAPS", "Value": "Not Installed"})
 
@@ -626,8 +805,8 @@ class PyADRecon:
                     "Trust Direction": TRUST_DIRECTION.get(safe_int(trust_dir), "Unknown"),
                     "Trust Type": TRUST_TYPE.get(safe_int(trust_type), "Unknown"),
                     "Attributes": ", ".join(attrs_list),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -653,8 +832,8 @@ class PyADRecon:
                 results.append({
                     "Name": get_attr(entry, 'name', ''),
                     "Description": get_attr(entry, 'description', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -689,8 +868,8 @@ class PyADRecon:
                     "Site": site_name,
                     "Name": get_attr(entry, 'name', ''),
                     "Description": get_attr(entry, 'description', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -706,38 +885,164 @@ class PyADRecon:
         results = []
 
         try:
-            # Find DCs using primaryGroupID or userAccountControl
-            # Using (&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))
+            # Get FSMO role holders
+            fsmo_roles = {
+                'pdc': None,
+                'rid': None,
+                'infra': None,
+                'schema': None,
+                'naming': None
+            }
+            
+            # PDC Emulator - stored in domain object
+            try:
+                domain_entries = self.search(self.base_dn, "(objectCategory=domainDNS)", ['fSMORoleOwner'])
+                if domain_entries:
+                    pdc_owner = get_attr(domain_entries[0], 'fSMORoleOwner', '')
+                    if pdc_owner:
+                        fsmo_roles['pdc'] = str(pdc_owner).split(',')[1].replace('CN=', '').upper()
+            except:
+                pass
+            
+            # RID Master - stored in RID Manager object
+            try:
+                rid_entries = self.search(f"CN=RID Manager$,CN=System,{self.base_dn}", "(objectClass=*)", ['fSMORoleOwner'])
+                if rid_entries:
+                    rid_owner = get_attr(rid_entries[0], 'fSMORoleOwner', '')
+                    if rid_owner:
+                        fsmo_roles['rid'] = str(rid_owner).split(',')[1].replace('CN=', '').upper()
+            except:
+                pass
+            
+            # Infrastructure Master - stored in Infrastructure object
+            try:
+                infra_entries = self.search(f"CN=Infrastructure,{self.base_dn}", "(objectClass=*)", ['fSMORoleOwner'])
+                if infra_entries:
+                    infra_owner = get_attr(infra_entries[0], 'fSMORoleOwner', '')
+                    if infra_owner:
+                        fsmo_roles['infra'] = str(infra_owner).split(',')[1].replace('CN=', '').upper()
+            except:
+                pass
+            
+            # Schema Master - stored in Schema container
+            try:
+                schema_entries = self.search(self.schema_dn, "(objectClass=dMD)", ['fSMORoleOwner'])
+                if schema_entries:
+                    schema_owner = get_attr(schema_entries[0], 'fSMORoleOwner', '')
+                    if schema_owner:
+                        fsmo_roles['schema'] = str(schema_owner).split(',')[1].replace('CN=', '').upper()
+            except:
+                pass
+            
+            # Domain Naming Master - stored in Partitions container
+            try:
+                naming_entries = self.search(f"CN=Partitions,{self.config_dn}", "(objectClass=crossRefContainer)", ['fSMORoleOwner'])
+                if naming_entries:
+                    naming_owner = get_attr(naming_entries[0], 'fSMORoleOwner', '')
+                    if naming_owner:
+                        fsmo_roles['naming'] = str(naming_owner).split(',')[1].replace('CN=', '').upper()
+            except:
+                pass
+
+            # Find DCs using userAccountControl
             entries = self.search(
                 self.base_dn,
                 "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))",
-                ['name', 'dNSHostName', 'operatingSystem', 'operatingSystemVersion',
-                 'operatingSystemServicePack', 'whenCreated', 'whenChanged',
-                 'msDS-isRODC', 'serverReferenceBL']
+                ['name', 'dNSHostName', 'operatingSystem', 'serverReferenceBL']
             )
 
+            # Also try to get IP addresses from DNS records
+            dc_ips = {}
+            try:
+                dns_entries = self.search(
+                    f"CN=MicrosoftDNS,DC=DomainDnsZones,{self.base_dn}",
+                    "(&(objectClass=dnsNode)(!(dNSTombstoned=TRUE)))",
+                    ['name', 'dnsRecord']
+                )
+                for dns_entry in dns_entries:
+                    dns_name = get_attr(dns_entry, 'name', '').lower()
+                    dns_records = get_attr_list(dns_entry, 'dnsRecord')
+                    for record in dns_records:
+                        # Try to parse A record (IPv4)
+                        if isinstance(record, bytes) and len(record) >= 24:
+                            # A record type = 1, check at offset 2-3
+                            record_type = struct.unpack('<H', record[2:4])[0]
+                            if record_type == 1:  # A record
+                                # IPv4 address is at offset 24
+                                ip = '.'.join(str(b) for b in record[24:28])
+                                dc_ips[dns_name] = ip
+            except Exception as e:
+                logger.debug(f"Could not query DNS records: {e}")
+
             for entry in entries:
-                is_rodc = get_attr(entry, 'msDS-isRODC', False)
-
-                dc_info = {
-                    "Name": safe_str(get_attr(entry, 'name', '')),
-                    "Hostname": safe_str(get_attr(entry, 'dNSHostName', '')),
-                    "Operating System": safe_str(get_attr(entry, 'operatingSystem', '')),
-                    "OS Version": safe_str(get_attr(entry, 'operatingSystemVersion', '')),
-                    "OS Service Pack": safe_str(get_attr(entry, 'operatingSystemServicePack', '')),
-                    "Is RODC": str(is_rodc),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
-                }
-
-                # Try to get IP address
+                dc_name = safe_str(get_attr(entry, 'name', '')).upper()
                 hostname = safe_str(get_attr(entry, 'dNSHostName', ''))
+                
+                # Get IPv4 address - try multiple methods
+                ipv4 = ""
                 if hostname:
-                    try:
-                        ip = socket.gethostbyname(hostname)
-                        dc_info["IPv4Address"] = ip
-                    except socket.gaierror:
-                        dc_info["IPv4Address"] = ""
+                    # Try DNS records first
+                    hostname_lower = hostname.lower()
+                    if hostname_lower in dc_ips:
+                        ipv4 = dc_ips[hostname_lower]
+                    else:
+                        # Try short name
+                        short_name = hostname.split('.')[0].lower()
+                        if short_name in dc_ips:
+                            ipv4 = dc_ips[short_name]
+                        else:
+                            # Try socket resolution
+                            try:
+                                ipv4 = socket.gethostbyname(hostname)
+                            except:
+                                # If all else fails, and this is the DC we're connected to, use config IP
+                                if hostname.lower() == self.config.domain_controller.lower() or \
+                                   dc_name.lower() == self.config.domain_controller.lower():
+                                    ipv4 = self.config.domain_controller
+                
+                # Get site information from serverReferenceBL
+                site = ""
+                server_ref = get_attr(entry, 'serverReferenceBL', '')
+                if server_ref:
+                    # serverReferenceBL looks like: CN=DC1,CN=Servers,CN=Default-First-Site-Name,CN=Sites,CN=Configuration,DC=...
+                    parts = str(server_ref).split(',')
+                    for i, part in enumerate(parts):
+                        if part.startswith('CN=Sites'):
+                            if i > 0:
+                                site = parts[i-1].replace('CN=', '')
+                            break
+                
+                # Check FSMO roles for this DC
+                is_pdc = fsmo_roles['pdc'] == dc_name
+                is_rid = fsmo_roles['rid'] == dc_name
+                is_infra = fsmo_roles['infra'] == dc_name
+                is_schema = fsmo_roles['schema'] == dc_name
+                is_naming = fsmo_roles['naming'] == dc_name
+                
+                # SMB detection (simplified - would need actual SMB protocol testing)
+                smb_port_open = "TRUE" if ipv4 else "FALSE"
+                
+                dc_info = {
+                    "Domain": dn_to_fqdn(self.base_dn),
+                    "Site": site,
+                    "Name": dc_name.lower(),
+                    "IPv4Address": ipv4,
+                    "Operating System": safe_str(get_attr(entry, 'operatingSystem', '')),
+                    "Hostname": hostname,
+                    "Infra": "TRUE" if is_infra else "FALSE",
+                    "Naming": "TRUE" if is_naming else "FALSE",
+                    "Schema": "TRUE" if is_schema else "FALSE",
+                    "RID": "TRUE" if is_rid else "FALSE",
+                    "PDC": "TRUE" if is_pdc else "FALSE",
+                    "SMB Port Open": smb_port_open,
+                    "SMB1(NT LM 0.12)": "FALSE",  # Would require SMB protocol testing
+                    "SMB2(0x0202)": "TRUE",  # Placeholder
+                    "SMB2(0x0210)": "TRUE",  # Placeholder
+                    "SMB3(0x0300)": "TRUE",  # Placeholder
+                    "SMB3(0x0302)": "TRUE",  # Placeholder
+                    "SMB3(0x0311)": "FALSE",  # Placeholder
+                    "SMB Signing": "TRUE",  # Placeholder
+                }
 
                 results.append(dc_info)
 
@@ -766,48 +1071,160 @@ class PyADRecon:
                 entry = entries[0]
 
                 # Convert password age from 100-nanosecond intervals to days
+                # Note: ldap3 automatically converts these to timedelta objects
                 max_pwd_age = get_attr(entry, 'maxPwdAge')
                 min_pwd_age = get_attr(entry, 'minPwdAge')
                 lockout_duration = get_attr(entry, 'lockoutDuration')
                 lockout_window = get_attr(entry, 'lockoutObservationWindow')
 
                 def convert_interval_to_days(interval):
+                    """Convert AD time interval to days (handles both timedelta and raw values)."""
                     if interval is None:
                         return "Not Set"
                     try:
-                        # Negative value in 100-nanosecond intervals
-                        interval = abs(safe_int(interval))
-                        if interval == 0:
+                        # ldap3 returns timedelta objects for these attributes
+                        if isinstance(interval, timedelta):
+                            days = interval.days
+                            return days if days > 0 else "Not Set"
+                        
+                        # Fallback for raw integer values (100-nanosecond units)
+                        if isinstance(interval, str):
+                            interval_val = int(interval)
+                        else:
+                            interval_val = int(interval)
+                        
+                        # Check for 0 or positive values that indicate "never expires"
+                        if interval_val == 0 or interval_val > 0:
                             return "Not Set"
-                        days = interval / (10000000 * 60 * 60 * 24)
-                        return f"{days:.2f} days"
-                    except:
-                        return str(interval)
+                        
+                        # AD stores as negative value in 100-nanosecond intervals
+                        days = abs(interval_val) / (10000000 * 60 * 60 * 24)
+                        return int(round(days))
+                    except Exception as e:
+                        logger.debug(f"Error converting interval to days: {interval}, error: {e}")
+                        return "Not Set"
 
                 def convert_interval_to_minutes(interval):
+                    """Convert AD time interval to minutes (handles both timedelta and raw values)."""
                     if interval is None:
                         return "Not Set"
                     try:
-                        interval = abs(safe_int(interval))
-                        if interval == 0:
+                        # ldap3 returns timedelta objects for these attributes
+                        if isinstance(interval, timedelta):
+                            minutes = int(interval.total_seconds() / 60)
+                            return minutes if minutes > 0 else "Not Set"
+                        
+                        # Fallback for raw integer values (100-nanosecond units)
+                        if isinstance(interval, str):
+                            interval_val = int(interval)
+                        else:
+                            interval_val = int(interval)
+                        
+                        # Check for 0 or positive values
+                        if interval_val == 0 or interval_val > 0:
                             return "Not Set"
-                        minutes = interval / (10000000 * 60)
-                        return f"{minutes:.0f} minutes"
-                    except:
-                        return str(interval)
+                        
+                        # AD stores as negative value in 100-nanosecond intervals
+                        minutes = abs(interval_val) / (10000000 * 60)
+                        return int(round(minutes))
+                    except Exception as e:
+                        logger.debug(f"Error converting interval to minutes: {interval}, error: {e}")
+                        return "Not Set"
 
                 pwd_props = get_attr(entry, 'pwdProperties', 0)
                 pwd_props = safe_int(pwd_props)
 
-                results.append({"Policy": "Minimum Password Length", "Value": str(get_attr(entry, 'minPwdLength', ''))})
-                results.append({"Policy": "Password History Length", "Value": str(get_attr(entry, 'pwdHistoryLength', ''))})
-                results.append({"Policy": "Maximum Password Age", "Value": convert_interval_to_days(max_pwd_age)})
-                results.append({"Policy": "Minimum Password Age", "Value": convert_interval_to_days(min_pwd_age)})
-                results.append({"Policy": "Lockout Threshold", "Value": str(get_attr(entry, 'lockoutThreshold', ''))})
-                results.append({"Policy": "Lockout Duration", "Value": convert_interval_to_minutes(lockout_duration)})
-                results.append({"Policy": "Lockout Observation Window", "Value": convert_interval_to_minutes(lockout_window)})
-                results.append({"Policy": "Password Complexity Required", "Value": str(bool(pwd_props & 1))})
-                results.append({"Policy": "Reversible Encryption Enabled", "Value": str(bool(pwd_props & 16))})
+                # Match ADRecon order and naming with security best practices
+                results.append({
+                    "Policy": "Enforce password history (passwords)",
+                    "Current Value": str(get_attr(entry, 'pwdHistoryLength', '')),
+                    "PCI DSS v3.2.1": "4",
+                    "PCI DSS v4.0": "4",
+                    "PCI DSS Requirement": "Req. 8.2.5 / 8.3.7",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "24 or more"
+                })
+                results.append({
+                    "Policy": "Maximum password age (days)",
+                    "Current Value": convert_interval_to_days(max_pwd_age),
+                    "PCI DSS v3.2.1": "90",
+                    "PCI DSS v4.0": "90",
+                    "PCI DSS Requirement": "Req. 8.2.4 / 8.3.9",
+                    "ACSC ISM": "365",
+                    "ISM Controls 16Jun2022": "ISM-1590 Rev:1 Mar22",
+                    "CIS Benchmark 2022": "1 to 365"
+                })
+                results.append({
+                    "Policy": "Minimum password age (days)",
+                    "Current Value": convert_interval_to_days(min_pwd_age),
+                    "PCI DSS v3.2.1": "N/A",
+                    "PCI DSS v4.0": "N/A",
+                    "PCI DSS Requirement": "-",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "1 or more"
+                })
+                results.append({
+                    "Policy": "Minimum password length (characters)",
+                    "Current Value": str(get_attr(entry, 'minPwdLength', '')),
+                    "PCI DSS v3.2.1": "7",
+                    "PCI DSS v4.0": "12",
+                    "PCI DSS Requirement": "Req. 8.2.3 / 8.3.6",
+                    "ACSC ISM": "14",
+                    "ISM Controls 16Jun2022": "Control: ISM-0421 Rev:8 Dec21",
+                    "CIS Benchmark 2022": "14 or more"
+                })
+                results.append({
+                    "Policy": "Password must meet complexity requirements",
+                    "Current Value": "TRUE" if (pwd_props & 1) else "FALSE",
+                    "PCI DSS v3.2.1": "TRUE",
+                    "PCI DSS v4.0": "TRUE",
+                    "PCI DSS Requirement": "Req. 8.2.3 / 8.3.6",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "TRUE"
+                })
+                results.append({
+                    "Policy": "Store password using reversible encryption for all users in the domain",
+                    "Current Value": "TRUE" if (pwd_props & 16) else "FALSE",
+                    "PCI DSS v3.2.1": "N/A",
+                    "PCI DSS v4.0": "N/A",
+                    "PCI DSS Requirement": "-",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "FALSE"
+                })
+                results.append({
+                    "Policy": "Account lockout duration (mins)",
+                    "Current Value": convert_interval_to_minutes(lockout_duration),
+                    "PCI DSS v3.2.1": "0 (manual unlock) or 30",
+                    "PCI DSS v4.0": "0 (manual unlock) or 30",
+                    "PCI DSS Requirement": "Req. 8.1.7 / 8.3.4",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "15 or more"
+                })
+                results.append({
+                    "Policy": "Account lockout threshold (attempts)",
+                    "Current Value": str(get_attr(entry, 'lockoutThreshold', '')),
+                    "PCI DSS v3.2.1": "1 to 6",
+                    "PCI DSS v4.0": "1 to 10",
+                    "PCI DSS Requirement": "Req. 8.1.6 / 8.3.4",
+                    "ACSC ISM": "1 to 5",
+                    "ISM Controls 16Jun2022": "Control: ISM-1403 Rev:2 Oct19",
+                    "CIS Benchmark 2022": "1 to 5"
+                })
+                results.append({
+                    "Policy": "Reset account lockout counter after (mins)",
+                    "Current Value": convert_interval_to_minutes(lockout_window),
+                    "PCI DSS v3.2.1": "N/A",
+                    "PCI DSS v4.0": "N/A",
+                    "PCI DSS Requirement": "-",
+                    "ACSC ISM": "N/A",
+                    "ISM Controls 16Jun2022": "-",
+                    "CIS Benchmark 2022": "15 or more"
+                })
 
         except Exception as e:
             logger.warning(f"Error collecting password policy: {e}")
@@ -857,7 +1274,7 @@ class PyADRecon:
         """Collect user objects."""
         logger.info("[-] Collecting Users - May take some time...")
         results = []
-        now = datetime.now()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         try:
             # Using (&(objectCategory=person)(objectClass=user)) instead of samAccountType
@@ -885,32 +1302,49 @@ class PyADRecon:
 
                 # Password last set
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes, not integers
+                pwd_last_set_dt = None
                 pwd_age_days = None
                 must_change_pwd = False
                 pwd_not_changed_max = False
-
-                if pwd_last_set_dt:
-                    pwd_age_days = (now - pwd_last_set_dt).days
-                    if pwd_age_days > self.config.password_age_days:
-                        pwd_not_changed_max = True
-                elif pwd_last_set_int == 0 and not uac_parsed.get('PasswordNeverExpires', False):
+                
+                if isinstance(pwd_last_set, datetime):
+                    # Check if pwdLastSet is 0 (1601-01-01 epoch) which means "must change password at logon"
+                    if pwd_last_set.year == 1601:
+                        must_change_pwd = True
+                        pwd_last_set_dt = None  # Don't show the 1601 date
+                    else:
+                        pwd_last_set_dt = pwd_last_set
+                        # Calculate age in UTC
+                        pwd_last_set_utc = pwd_last_set.replace(tzinfo=None) if pwd_last_set.tzinfo else pwd_last_set
+                        pwd_age_days = (now - pwd_last_set_utc).days
+                        if pwd_age_days > self.config.password_age_days:
+                            pwd_not_changed_max = True
+                else:
+                    # If not a datetime, user must change password at next logon
                     must_change_pwd = True
 
                 # Last logon
                 last_logon = get_attr(entry, 'lastLogonTimestamp')
-                last_logon_int = safe_int(last_logon)
-                last_logon_dt = windows_timestamp_to_datetime(last_logon_int) if last_logon_int else None
+                # ldap3 returns datetime objects for these attributes, not integers
+                last_logon_dt = None
                 logon_age_days = None
                 never_logged_in = True
                 dormant = False
 
-                if last_logon_dt:
-                    never_logged_in = False
-                    logon_age_days = (now - last_logon_dt).days
-                    if logon_age_days > self.config.dormant_days:
-                        dormant = True
+                if isinstance(last_logon, datetime):
+                    # Check if lastLogonTimestamp is 0 (1601-01-01 epoch) which means never logged in
+                    if last_logon.year == 1601:
+                        last_logon_dt = None
+                        never_logged_in = True
+                    else:
+                        last_logon_dt = last_logon
+                        never_logged_in = False
+                        # Calculate age in UTC
+                        last_logon_utc = last_logon.replace(tzinfo=None) if last_logon.tzinfo else last_logon
+                        logon_age_days = (now - last_logon_utc).days
+                        if logon_age_days > self.config.dormant_days:
+                            dormant = True
 
                 # Account expiration
                 acc_expires = get_attr(entry, 'accountExpires')
@@ -962,13 +1396,13 @@ class PyADRecon:
                     "Smartcard Logon Required": uac_parsed.get('SmartcardRequired', False),
                     "Delegation Permitted": not uac_parsed.get('NotDelegated', False),
                     "Kerberos DES Only": uac_parsed.get('UseDESKeyOnly', False),
-                    "Kerberos RC4": kerb_enc.get('RC4', ''),
-                    "Kerberos AES-128bit": kerb_enc.get('AES128', ''),
-                    "Kerberos AES-256bit": kerb_enc.get('AES256', ''),
+                    "Kerberos RC4": kerb_enc.get('RC4', '') if kerb_enc.get('RC4') else '',
+                    "Kerberos AES-128bit": kerb_enc.get('AES128', '') if kerb_enc.get('AES128') else '',
+                    "Kerberos AES-256bit": kerb_enc.get('AES256', '') if kerb_enc.get('AES256') else '',
                     "Does Not Require Pre Auth": uac_parsed.get('DoesNotRequirePreAuth', False),
                     "Never Logged in": never_logged_in,
-                    "Logon Age (days)": logon_age_days,
-                    "Password Age (days)": pwd_age_days,
+                    "Logon Age (days)": logon_age_days if logon_age_days is not None else "",
+                    "Password Age (days)": pwd_age_days if pwd_age_days is not None else "",
                     f"Dormant (> {self.config.dormant_days} days)": dormant,
                     f"Password Age (> {self.config.password_age_days} days)": pwd_not_changed_max,
                     "Account Locked Out": uac_parsed.get('AccountLockedOut', False),
@@ -989,10 +1423,10 @@ class PyADRecon:
                     "Company": get_attr(entry, 'company', ''),
                     "Manager": get_attr(entry, 'manager', ''),
                     "Info": get_attr(entry, 'info', ''),
-                    "Last Logon Date": str(last_logon_dt) if last_logon_dt else "",
-                    "Password LastSet": str(pwd_last_set_dt) if pwd_last_set_dt else "",
-                    "Account Expiration Date": str(acc_expires_dt) if acc_expires_dt else "",
-                    "Account Expiration (days)": acc_expires_days,
+                    "Last Logon Date": format_datetime(last_logon_dt),
+                    "Password LastSet": format_datetime(pwd_last_set_dt),
+                    "Account Expiration Date": format_datetime(acc_expires_dt),
+                    "Account Expiration (days)": acc_expires_days if acc_expires_days is not None else "",
                     "Mobile": get_attr(entry, 'mobile', ''),
                     "Email": get_attr(entry, 'mail', ''),
                     "HomeDirectory": get_attr(entry, 'homeDirectory', ''),
@@ -1003,8 +1437,8 @@ class PyADRecon:
                     "Middle Name": get_attr(entry, 'middleName', ''),
                     "Last Name": get_attr(entry, 'sn', ''),
                     "Country": get_attr(entry, 'c', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                     "CanonicalName": get_attr(entry, 'canonicalName', ''),
                 })
@@ -1042,8 +1476,11 @@ class PyADRecon:
                 uac_parsed = parse_uac(uac)
 
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes
+                pwd_last_set_dt = None
+                if isinstance(pwd_last_set, datetime):
+                    # Convert timezone-aware datetime to naive for comparison
+                    pwd_last_set_dt = pwd_last_set.replace(tzinfo=None) if pwd_last_set.tzinfo else pwd_last_set
 
                 # Get group memberships
                 member_of = get_attr_list(entry, 'memberOf')
@@ -1059,12 +1496,12 @@ class PyADRecon:
                     host = spn_parts[1] if len(spn_parts) > 1 else ""
 
                     results.append({
-                        "Username": get_attr(entry, 'sAMAccountName', ''),
+                        "UserName": get_attr(entry, 'sAMAccountName', ''),
                         "Name": get_attr(entry, 'name', ''),
                         "Enabled": uac_parsed.get('Enabled', ''),
                         "Service": service,
                         "Host": host,
-                        "Password Last Set": str(pwd_last_set_dt) if pwd_last_set_dt else "",
+                        "Password Last Set": format_datetime(pwd_last_set_dt),
                         "Description": get_attr(entry, 'description', ''),
                         "Primary GroupID": get_attr(entry, 'primaryGroupID', ''),
                         "Memberof": ", ".join(groups),
@@ -1122,16 +1559,15 @@ class PyADRecon:
 
                 results.append({
                     "Name": get_attr(entry, 'name', ''),
-                    "SamAccountName": get_attr(entry, 'sAMAccountName', ''),
-                    "Category": group_category,
-                    "Scope": group_scope,
                     "AdminCount": get_attr(entry, 'adminCount', ''),
-                    "Description": get_attr(entry, 'description', ''),
+                    "GroupCategory": group_category,
+                    "GroupScope": group_scope,
                     "ManagedBy": managed_by,
                     "SID": sid_to_string(get_attr(entry, 'objectSid')),
                     "SIDHistory": sid_history_str,
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "Description": get_attr(entry, 'description', ''),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                     "CanonicalName": get_attr(entry, 'canonicalName', ''),
                 })
@@ -1165,12 +1601,58 @@ class PyADRecon:
                     # Extract member name from DN
                     match = re.search(r'CN=([^,]+)', str(member_dn))
                     member_name = match.group(1) if match else str(member_dn)
+                    
+                    # Query member details
+                    member_username = ""
+                    member_sid = ""
+                    account_type = ""
+                    
+                    try:
+                        # Look up the member object to get its details
+                        member_entries = self.search(
+                            str(member_dn),
+                            "(objectClass=*)",
+                            ['sAMAccountName', 'objectSid', 'objectClass'],
+                            search_scope=BASE
+                        )
+                        
+                        if member_entries:
+                            member_entry = member_entries[0]
+                            member_username = get_attr(member_entry, 'sAMAccountName', '')
+                            member_sid_raw = get_attr(member_entry, 'objectSid')
+                            if member_sid_raw:
+                                member_sid = sid_to_string(member_sid_raw)
+                            
+                            # Determine account type from objectClass
+                            object_classes = get_attr_list(member_entry, 'objectClass')
+                            object_classes_str = [str(oc).lower() for oc in object_classes]
+                            
+                            if 'user' in object_classes_str and 'computer' not in object_classes_str:
+                                account_type = "user"
+                            elif 'computer' in object_classes_str:
+                                account_type = "computer"
+                            elif 'group' in object_classes_str:
+                                account_type = "group"
+                            else:
+                                account_type = "unknown"
+                    except Exception:
+                        # If lookup fails, try to guess from DN
+                        member_dn_str = str(member_dn)
+                        if ',CN=Users,' in member_dn_str or ',OU=Users,' in member_dn_str:
+                            account_type = "user"
+                        elif ',CN=Computers,' in member_dn_str or ',OU=Computers,' in member_dn_str:
+                            account_type = "computer"
+                        elif ',CN=Builtin,' in member_dn_str or 'CN=Groups' in member_dn_str:
+                            account_type = "group"
+                        else:
+                            account_type = "unknown"
 
                     results.append({
                         "Group Name": group_name,
-                        "Group SamAccountName": group_sam,
+                        "Member UserName": member_username,
                         "Member Name": member_name,
-                        "Member DN": str(member_dn),
+                        "Member SID": member_sid,
+                        "AccountType": account_type,
                     })
 
         except Exception as e:
@@ -1195,14 +1677,18 @@ class PyADRecon:
 
             for entry in entries:
                 gp_link = get_attr(entry, 'gPLink', '')
+                dn = get_attr(entry, 'distinguishedName', '')
+                
+                # Calculate depth based on DN
+                depth = dn.count('OU=') if dn else 0
 
                 results.append({
                     "Name": get_attr(entry, 'name', ''),
+                    "Depth": depth,
                     "Description": get_attr(entry, 'description', ''),
-                    "gPLink": gp_link,
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
-                    "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
+                    "DistinguishedName": dn,
                 })
 
         except Exception as e:
@@ -1236,12 +1722,10 @@ class PyADRecon:
                 results.append({
                     "DisplayName": get_attr(entry, 'displayName', ''),
                     "GUID": get_attr(entry, 'name', ''),
-                    "User Settings Disabled": user_disabled,
-                    "Computer Settings Disabled": computer_disabled,
-                    "GPCFileSysPath": get_attr(entry, 'gPCFileSysPath', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
+                    "FilePath": get_attr(entry, 'gPCFileSysPath', ''),
                 })
 
         except Exception as e:
@@ -1287,19 +1771,41 @@ class PyADRecon:
 
             for entry in entries:
                 gp_link = get_attr(entry, 'gPLink', '')
-                if not gp_link:
-                    continue
-
                 gp_options = get_attr(entry, 'gPOptions', 0)
                 block_inheritance = bool(safe_int(gp_options) & 1)
+                
+                dn = get_attr(entry, 'distinguishedName', '')
+                depth = dn.count('OU=') if dn else 0
+                name = get_attr(entry, 'name', '')
+
+                # If no gPLink, add one entry showing the OU/Site exists but has no links
+                if not gp_link:
+                    results.append({
+                        "Name": name,
+                        "Depth": depth,
+                        "DistinguishedName": dn,
+                        "Link Order": "",
+                        "GPO": "",
+                        "Enforced": "",
+                        "Link Enabled": "",
+                        "BlockInheritance": block_inheritance,
+                        "gPLink": "",
+                        "gPOptions": gp_options,
+                    })
+                    continue
 
                 # Parse gPLink - format: [LDAP://cn={GUID},cn=policies,...;options][...]
                 links = re.findall(r'\[LDAP://([^;]+);(\d+)\]', str(gp_link), re.IGNORECASE)
 
-                for link_dn, link_options in links:
+                # Link order is reversed - first link in list has highest order number
+                total_links = len(links)
+                for idx, (link_dn, link_options) in enumerate(links):
                     link_options = int(link_options)
                     enforced = bool(link_options & 2)
                     disabled = bool(link_options & 1)
+                    
+                    # Calculate link order (reverse: first = highest number)
+                    link_order = total_links - idx
 
                     # Extract GPO GUID
                     guid_match = re.search(r'cn=(\{[^}]+\})', link_dn, re.IGNORECASE)
@@ -1307,13 +1813,16 @@ class PyADRecon:
                     gpo_display_name = gpo_dict.get(gpo_guid.lower(), gpo_guid)
 
                     results.append({
-                        "SOM Name": get_attr(entry, 'name', ''),
-                        "SOM DN": get_attr(entry, 'distinguishedName', ''),
-                        "Block Inheritance": block_inheritance,
-                        "GPO Name": gpo_display_name,
-                        "GPO GUID": gpo_guid,
-                        "Link Enabled": not disabled,
+                        "Name": name,
+                        "Depth": depth,
+                        "DistinguishedName": dn,
+                        "Link Order": link_order,
+                        "GPO": gpo_display_name,
                         "Enforced": enforced,
+                        "Link Enabled": not disabled,
+                        "BlockInheritance": block_inheritance,
+                        "gPLink": gp_link,
+                        "gPOptions": gp_options,
                     })
 
         except Exception as e:
@@ -1347,8 +1856,8 @@ class PyADRecon:
                     for entry in entries:
                         results.append({
                             "Name": get_attr(entry, 'name', ''),
-                            "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                            "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                            "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                            "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                             "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                         })
                 except Exception:
@@ -1362,9 +1871,209 @@ class PyADRecon:
         return results
 
     def collect_dns_records(self) -> List[Dict]:
-        """Collect DNS records."""
+        """Collect DNS records with full parsing."""
         logger.info("[-] Collecting DNS Records - May take some time...")
         results = []
+
+        def parse_dns_record(record_bytes):
+            """Parse DNS record from binary format."""
+            if not isinstance(record_bytes, bytes) or len(record_bytes) < 24:
+                return None
+            
+            try:
+                # DNS record header structure
+                data_length = struct.unpack('<H', record_bytes[0:2])[0]
+                record_type = struct.unpack('<H', record_bytes[2:4])[0]
+                version = struct.unpack('B', record_bytes[4:5])[0]
+                rank = struct.unpack('B', record_bytes[5:6])[0]
+                flags = struct.unpack('<H', record_bytes[6:8])[0]
+                serial = struct.unpack('<I', record_bytes[8:12])[0]
+                ttl_seconds = struct.unpack('<I', record_bytes[12:16])[0]
+                reserved = struct.unpack('<I', record_bytes[16:20])[0]
+                timestamp = struct.unpack('<I', record_bytes[20:24])[0]
+                
+                # Calculate age from timestamp (hours since 1/1/1601)
+                age = timestamp
+                
+                # Format timestamp
+                if timestamp == 0:
+                    timestamp_str = "[static]"
+                else:
+                    try:
+                        # Windows timestamp: hours since 1/1/1601
+                        base = datetime(1601, 1, 1)
+                        ts_datetime = base + timedelta(hours=timestamp)
+                        timestamp_str = ts_datetime.strftime('%m/%d/%Y %I:%M:%S %p')
+                    except:
+                        timestamp_str = "[static]"
+                
+                record_data = record_bytes[24:]
+                data_str = ""
+                type_name = ""
+                
+                # Parse different record types
+                if record_type == 1:  # A record
+                    type_name = "A"
+                    if len(record_data) >= 4:
+                        data_str = '.'.join(str(b) for b in record_data[0:4])
+                
+                elif record_type == 2:  # NS record
+                    type_name = "NS"
+                    # NS records have 2-byte header before the name
+                    data_str, _ = parse_dns_name(record_data, 2)
+                
+                elif record_type == 5:  # CNAME record
+                    type_name = "CNAME"
+                    # CNAME records have 2-byte header before the name
+                    data_str, _ = parse_dns_name(record_data, 2)
+                
+                elif record_type == 6:  # SOA record
+                    type_name = "SOA"
+                    # SOA structure in MS DNS: serial(4), refresh(4), retry(4), expire(4), minimum(4), then names
+                    # Total 20 bytes of integers, then 2-byte header, primary NS, 2-byte header, admin email
+                    if len(record_data) >= 20:
+                        soa_serial = struct.unpack('>I', record_data[0:4])[0]
+                        refresh = struct.unpack('>I', record_data[4:8])[0]
+                        retry = struct.unpack('>I', record_data[8:12])[0]
+                        expire = struct.unpack('>I', record_data[12:16])[0]
+                        minimum = struct.unpack('>I', record_data[16:20])[0]
+                        # Primary NS starts at offset 22 (after 20 bytes + 2-byte header)
+                        primary_ns, offset = parse_dns_name(record_data, 22)
+                        # Admin email has 2-byte header before it
+                        admin_email, offset = parse_dns_name(record_data, offset + 2)
+                        data_str = f"[{soa_serial}][{primary_ns}][{admin_email}][{refresh}][{retry}][{expire}][{minimum}]"
+                
+                elif record_type == 12:  # PTR record
+                    type_name = "PTR"
+                    # PTR records have 2-byte header before the name
+                    data_str, _ = parse_dns_name(record_data, 2)
+                
+                elif record_type == 15:  # MX record
+                    type_name = "MX"
+                    if len(record_data) >= 2:
+                        preference = struct.unpack('>H', record_data[0:2])[0]
+                        exchange, _ = parse_dns_name(record_data, 2)
+                        data_str = f"[{preference}][{exchange}]"
+                
+                elif record_type == 16:  # TXT record
+                    type_name = "TXT"
+                    if len(record_data) > 0:
+                        txt_len = record_data[0]
+                        if len(record_data) >= txt_len + 1:
+                            data_str = record_data[1:txt_len+1].decode('utf-8', errors='ignore')
+                
+                elif record_type == 28:  # AAAA record (IPv6)
+                    type_name = "AAAA"
+                    if len(record_data) >= 16:
+                        ipv6_parts = []
+                        for i in range(0, 16, 2):
+                            part = struct.unpack('>H', record_data[i:i+2])[0]
+                            ipv6_parts.append(f"{part:04x}")
+                        data_str = ':'.join(ipv6_parts)
+                
+                elif record_type == 33:  # SRV record
+                    type_name = "SRV"
+                    if len(record_data) >= 8:
+                        priority = struct.unpack('>H', record_data[0:2])[0]
+                        weight = struct.unpack('>H', record_data[2:4])[0]
+                        port = struct.unpack('>H', record_data[4:6])[0]
+                        # SRV records have the 6-byte fixed header, then 2-byte header before DNS name
+                        target, _ = parse_dns_name(record_data, 8)
+                        data_str = f"[{priority}][{weight}][{port}][{target}]"
+                
+                else:
+                    type_name = f"TYPE{record_type}"
+                    data_str = record_data.hex() if record_data else ""
+                
+                return {
+                    'RecordType': type_name,
+                    'Data': data_str,
+                    'TTL': ttl_seconds,
+                    'Age': age,
+                    'TimeStamp': timestamp_str,
+                    'UpdatedAtSerial': serial
+                }
+                
+            except Exception as e:
+                logger.debug(f"Error parsing DNS record: {e}")
+                return None
+        
+        def parse_dns_name(data, offset=0):
+            """Parse DNS name from record data in label format."""
+            if not data or offset >= len(data):
+                return "", offset
+            
+            try:
+                name_parts = []
+                jumped = False
+                saved_offset = 0
+                
+                while offset < len(data):
+                    if offset >= len(data):
+                        break
+                    
+                    length = data[offset]
+                    
+                    # End of name
+                    if length == 0:
+                        offset += 1
+                        break
+                    
+                    # Compression pointer (starts with 11 in top 2 bits)
+                    if length >= 0xC0:
+                        if not jumped:
+                            saved_offset = offset + 2
+                        if offset + 1 < len(data):
+                            # Get the pointer offset
+                            pointer = struct.unpack('>H', data[offset:offset+2])[0] & 0x3FFF
+                            # Recursively parse the name at the pointer location
+                            pointed_name, _ = parse_dns_name(data, pointer)
+                            if pointed_name and pointed_name != '.':
+                                name_parts.append(pointed_name.rstrip('.'))
+                            jumped = True
+                            offset = saved_offset
+                        break
+                    
+                    # Regular label - read length-prefixed string
+                    offset += 1
+                    if offset + length > len(data):
+                        break
+                    
+                    # Read the label bytes and decode
+                    label_bytes = data[offset:offset+length]
+                    try:
+                        label = label_bytes.decode('ascii', errors='replace')
+                        # Remove any non-printable characters but preserve the text
+                        label = ''.join(c for c in label if c.isprintable() or c in '.-_')
+                        if label:
+                            name_parts.append(label)
+                    except:
+                        pass
+                    
+                    offset += length
+                
+                if jumped and saved_offset > 0:
+                    offset = saved_offset
+                
+                result = '.'.join(name_parts)
+                if result and not result.endswith('.'):
+                    result += '.'
+                return result, offset
+                
+            except Exception as e:
+                logger.debug(f"Error parsing DNS name: {e}")
+                return "", offset
+        
+        def sanitize_value(value):
+            """Sanitize value for Excel - remove illegal characters."""
+            if isinstance(value, str):
+                # Remove control characters (0x00-0x1F except tab, newline, carriage return)
+                # Also remove 0x7F-0x9F
+                sanitized = ''.join(char for char in value if ord(char) >= 32 or char in '\t\n\r')
+                # Remove any remaining problematic characters
+                sanitized = sanitized.replace('\x00', '').replace('\x0b', '').replace('\x0c', '')
+                return sanitized
+            return value
 
         try:
             # Get DNS records from each zone
@@ -1372,6 +2081,7 @@ class PyADRecon:
                 self.collect_dns_zones()
 
             for zone in self.results.get('DNSZones', []):
+                zone_name = zone.get('Name', '')
                 zone_dn = zone.get('DistinguishedName', '')
                 if not zone_dn:
                     continue
@@ -1380,19 +2090,56 @@ class PyADRecon:
                     entries = self.search(
                         zone_dn,
                         "(objectCategory=dnsNode)",
-                        ['name', 'dnsRecord', 'dNSTombstoned', 'whenCreated', 'whenChanged']
+                        ['name', 'dnsRecord', 'dNSTombstoned', 'whenCreated', 'whenChanged',
+                         'showInAdvancedViewOnly', 'distinguishedName']
                     )
 
                     for entry in entries:
-                        results.append({
-                            "Zone": zone.get('Name', ''),
-                            "Name": get_attr(entry, 'name', ''),
-                            "Tombstoned": str(get_attr(entry, 'dNSTombstoned', '')),
-                            "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                            "whenChanged": str(get_attr(entry, 'whenChanged', '')),
-                        })
-                except Exception:
-                    pass
+                        name = get_attr(entry, 'name', '')
+                        dns_records = get_attr_list(entry, 'dnsRecord')
+                        tombstoned = get_attr(entry, 'dNSTombstoned', False)
+                        when_created = format_datetime(get_attr(entry, 'whenCreated'))
+                        when_changed = format_datetime(get_attr(entry, 'whenChanged'))
+                        show_advanced = str(get_attr(entry, 'showInAdvancedViewOnly', 'TRUE')).upper()
+                        dn = get_attr(entry, 'distinguishedName', '')
+                        
+                        # Parse each DNS record (can be multiple per node)
+                        if dns_records:
+                            for record_bytes in dns_records:
+                                parsed = parse_dns_record(record_bytes)
+                                if parsed:
+                                    results.append({
+                                        "ZoneName": sanitize_value(zone_name),
+                                        "Name": sanitize_value(name),
+                                        "RecordType": sanitize_value(parsed['RecordType']),
+                                        "Data": sanitize_value(parsed['Data']),
+                                        "TTL": parsed['TTL'],
+                                        "Age": parsed['Age'],
+                                        "TimeStamp": sanitize_value(parsed['TimeStamp']),
+                                        "UpdatedAtSerial": parsed['UpdatedAtSerial'],
+                                        "whenCreated": sanitize_value(when_created),
+                                        "whenChanged": sanitize_value(when_changed),
+                                        "showInAdvancedViewOnly": sanitize_value(show_advanced),
+                                        "DistinguishedName": sanitize_value(dn)
+                                    })
+                        else:
+                            # No DNS records, but still add the node
+                            results.append({
+                                "ZoneName": sanitize_value(zone_name),
+                                "Name": sanitize_value(name),
+                                "RecordType": "",
+                                "Data": "",
+                                "TTL": "",
+                                "Age": "",
+                                "TimeStamp": "",
+                                "UpdatedAtSerial": "",
+                                "whenCreated": sanitize_value(when_created),
+                                "whenChanged": sanitize_value(when_changed),
+                                "showInAdvancedViewOnly": sanitize_value(show_advanced),
+                                "DistinguishedName": sanitize_value(dn)
+                            })
+                except Exception as e:
+                    logger.debug(f"Error processing zone {zone_name}: {e}")
 
         except Exception as e:
             logger.warning(f"Error collecting DNS records: {e}")
@@ -1425,8 +2172,8 @@ class PyADRecon:
                     "Driver Version": get_attr(entry, 'driverVersion', ''),
                     "UNC Name": get_attr(entry, 'uNCName', ''),
                     "URL": get_attr(entry, 'url', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                 })
 
         except Exception as e:
@@ -1437,13 +2184,14 @@ class PyADRecon:
         return results
 
     def collect_computers(self) -> List[Dict]:
-        """Collect computer objects."""
+        """Collect computer objects and service accounts (users ending in $)."""
         logger.info("[-] Collecting Computers - May take some time...")
         results = []
-        now = datetime.now()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         try:
-            # Using objectCategory=computer instead of samAccountType
+            # Collect both computer objects AND user accounts ending in $ (service accounts)
+            # Filter 1: Computer objects
             filter_str = "(objectCategory=computer)"
             if self.config.only_enabled:
                 filter_str = "(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
@@ -1459,6 +2207,44 @@ class PyADRecon:
                  'ms-ds-CreatorSid', 'msDS-SupportedEncryptionTypes',
                  'whenCreated', 'whenChanged']
             )
+            
+            # Filter 2: User accounts ending in $ (service accounts that look like computers)
+            service_filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=*$))"
+            if self.config.only_enabled:
+                service_filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=*$)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            
+            service_entries = self.search(
+                self.base_dn,
+                service_filter,
+                ['sAMAccountName', 'name', 'distinguishedName', 'dNSHostName',
+                 'operatingSystem', 'operatingSystemVersion', 'operatingSystemServicePack',
+                 'operatingSystemHotfix', 'userAccountControl', 'pwdLastSet',
+                 'lastLogonTimestamp', 'description', 'primaryGroupID', 'objectSid',
+                 'sIDHistory', 'servicePrincipalName', 'msDS-AllowedToDelegateTo',
+                 'ms-ds-CreatorSid', 'msDS-SupportedEncryptionTypes',
+                 'whenCreated', 'whenChanged']
+            )
+            
+            # Filter 3: Managed Service Accounts (MSAs)
+            msa_filter = "(objectClass=msDS-ManagedServiceAccount)"
+            if self.config.only_enabled:
+                msa_filter = "(&(objectClass=msDS-ManagedServiceAccount)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            
+            msa_entries = self.search(
+                self.base_dn,
+                msa_filter,
+                ['sAMAccountName', 'name', 'distinguishedName', 'dNSHostName',
+                 'operatingSystem', 'operatingSystemVersion', 'operatingSystemServicePack',
+                 'operatingSystemHotfix', 'userAccountControl', 'pwdLastSet',
+                 'lastLogonTimestamp', 'description', 'primaryGroupID', 'objectSid',
+                 'sIDHistory', 'servicePrincipalName', 'msDS-AllowedToDelegateTo',
+                 'ms-ds-CreatorSid', 'msDS-SupportedEncryptionTypes',
+                 'whenCreated', 'whenChanged']
+            )
+            
+            # Combine all lists
+            entries.extend(service_entries)
+            entries.extend(msa_entries)
 
             for entry in entries:
                 uac = get_attr(entry, 'userAccountControl', 0)
@@ -1466,25 +2252,41 @@ class PyADRecon:
 
                 # Password last set
                 pwd_last_set = get_attr(entry, 'pwdLastSet')
-                pwd_last_set_int = safe_int(pwd_last_set)
-                pwd_last_set_dt = windows_timestamp_to_datetime(pwd_last_set_int) if pwd_last_set_int else None
+                # ldap3 returns datetime objects for these attributes
+                pwd_last_set_dt = None
+                if isinstance(pwd_last_set, datetime):
+                    # Check if pwdLastSet is 0 (1601-01-01 epoch) which means password never set
+                    if pwd_last_set.year == 1601:
+                        pwd_last_set_dt = None
+                    else:
+                        pwd_last_set_dt = pwd_last_set
                 pwd_age_days = None
                 pwd_not_changed_max = False
 
                 if pwd_last_set_dt:
-                    pwd_age_days = (now - pwd_last_set_dt).days
+                    # Calculate age in UTC
+                    pwd_last_set_utc = pwd_last_set_dt.replace(tzinfo=None) if pwd_last_set_dt.tzinfo else pwd_last_set_dt
+                    pwd_age_days = (now - pwd_last_set_utc).days
                     if pwd_age_days > self.config.password_age_days:
                         pwd_not_changed_max = True
 
                 # Last logon
                 last_logon = get_attr(entry, 'lastLogonTimestamp')
-                last_logon_int = safe_int(last_logon)
-                last_logon_dt = windows_timestamp_to_datetime(last_logon_int) if last_logon_int else None
+                # ldap3 returns datetime objects for these attributes
+                last_logon_dt = None
+                if isinstance(last_logon, datetime):
+                    # Check if lastLogonTimestamp is 0 (1601-01-01 epoch) which means never logged in
+                    if last_logon.year == 1601:
+                        last_logon_dt = None
+                    else:
+                        last_logon_dt = last_logon
                 logon_age_days = None
                 dormant = False
 
                 if last_logon_dt:
-                    logon_age_days = (now - last_logon_dt).days
+                    # Calculate age in UTC
+                    last_logon_utc = last_logon_dt.replace(tzinfo=None) if last_logon_dt.tzinfo else last_logon_dt
+                    logon_age_days = (now - last_logon_utc).days
                     if logon_age_days > self.config.dormant_days:
                         dormant = True
 
@@ -1526,12 +2328,12 @@ class PyADRecon:
                 creator_sid_str = sid_to_string(creator_sid) if creator_sid else ""
 
                 results.append({
+                    "UserName": get_attr(entry, 'sAMAccountName', ''),
                     "Name": get_attr(entry, 'name', ''),
-                    "SamAccountName": get_attr(entry, 'sAMAccountName', ''),
                     "DNSHostName": get_attr(entry, 'dNSHostName', ''),
                     "Enabled": uac_parsed.get('Enabled', ''),
+                    "IPv4Address": "",  # This requires DNS resolution
                     "Operating System": os_full,
-                    "Description": get_attr(entry, 'description', ''),
                     "Logon Age (days)": logon_age_days,
                     "Password Age (days)": pwd_age_days,
                     f"Dormant (> {self.config.dormant_days} days)": dormant,
@@ -1539,18 +2341,17 @@ class PyADRecon:
                     "Delegation Type": delegation_type or "",
                     "Delegation Protocol": delegation_protocol or "",
                     "Delegation Services": delegation_services or "",
-                    "Kerberos RC4": kerb_enc.get('RC4', ''),
-                    "Kerberos AES-128bit": kerb_enc.get('AES128', ''),
-                    "Kerberos AES-256bit": kerb_enc.get('AES256', ''),
-                    "Primary GroupID": get_attr(entry, 'primaryGroupID', ''),
+                    "Primary Group ID": get_attr(entry, 'primaryGroupID', ''),
                     "SID": sid_to_string(get_attr(entry, 'objectSid')),
                     "SIDHistory": sid_history_str,
-                    "Creator SID": creator_sid_str,
-                    "Last Logon Date": str(last_logon_dt) if last_logon_dt else "",
-                    "Password LastSet": str(pwd_last_set_dt) if pwd_last_set_dt else "",
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
-                    "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
+                    "Description": get_attr(entry, 'description', ''),
+                    "ms-ds-CreatorSid": creator_sid_str,
+                    "Last Logon Date": format_datetime(last_logon_dt),
+                    "Password LastSet": format_datetime(pwd_last_set_dt),
+                    "UserAccountControl": uac,
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
+                    "Distinguished Name": get_attr(entry, 'distinguishedName', ''),
                 })
 
         except Exception as e:
@@ -1566,6 +2367,7 @@ class PyADRecon:
         results = []
 
         try:
+            # Collect computer objects
             filter_str = "(&(objectCategory=computer)(servicePrincipalName=*))"
             if self.config.only_enabled:
                 filter_str = "(&(objectCategory=computer)(servicePrincipalName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
@@ -1573,24 +2375,59 @@ class PyADRecon:
             entries = self.search(
                 self.base_dn,
                 filter_str,
-                ['name', 'servicePrincipalName']
+                ['name', 'sAMAccountName', 'servicePrincipalName']
             )
 
-            for entry in entries:
+            # Also collect Managed Service Accounts (MSAs)
+            msa_filter = "(objectClass=msDS-ManagedServiceAccount)"
+            if self.config.only_enabled:
+                msa_filter = "(&(objectClass=msDS-ManagedServiceAccount)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+            
+            msa_entries = self.search(
+                self.base_dn,
+                msa_filter,
+                ['name', 'sAMAccountName', 'servicePrincipalName']
+            )
+
+            # Combine both result sets
+            all_entries = list(entries) if entries else []
+            if msa_entries:
+                all_entries.extend(msa_entries)
+
+            # Group SPNs by (UserName, Name, Service) and collect hosts
+            grouped_spns = {}
+            
+            for entry in all_entries:
                 spns = get_attr_list(entry, 'servicePrincipalName')
+                sam_account = get_attr(entry, 'sAMAccountName', '')
                 computer_name = get_attr(entry, 'name', '')
 
                 for spn in spns:
+                    # SPNs can be: Service/Host or Service/Host/Realm
+                    # We want to extract Service and Host (ignoring Realm)
                     spn_parts = str(spn).split('/')
                     service = spn_parts[0] if len(spn_parts) > 0 else ""
                     host = spn_parts[1] if len(spn_parts) > 1 else ""
+                    
+                    # Remove port number if present (e.g., hostname:port)
+                    if ':' in host:
+                        host = host.split(':')[0]
 
-                    results.append({
-                        "Computer": computer_name,
-                        "Service": service,
-                        "Host": host,
-                        "SPN": str(spn),
-                    })
+                    # Group by (sam_account, computer_name, service)
+                    key = (sam_account, computer_name, service)
+                    if key not in grouped_spns:
+                        grouped_spns[key] = []
+                    if host and host not in grouped_spns[key]:
+                        grouped_spns[key].append(host)
+
+            # Convert grouped data to results list
+            for (sam_account, computer_name, service), hosts in grouped_spns.items():
+                results.append({
+                    "UserName": sam_account,  # Already includes $ suffix
+                    "Name": computer_name,
+                    "Service": service,
+                    "Host": ",".join(hosts),
+                })
 
         except Exception as e:
             logger.warning(f"Error collecting computer SPNs: {e}")
@@ -1616,7 +2453,7 @@ class PyADRecon:
                 logger.warning("[*] LAPS is not installed in this environment")
                 return results
 
-            # Get LAPS passwords
+            # Get LAPS passwords for computers
             entries = self.search(
                 self.base_dn,
                 "(objectCategory=computer)",
@@ -1624,7 +2461,30 @@ class PyADRecon:
                  'userAccountControl']
             )
 
-            for entry in entries:
+            # Also get service accounts (user objects ending in $)
+            service_entries = self.search(
+                self.base_dn,
+                "(&(objectCategory=person)(objectClass=user)(sAMAccountName=*$))",
+                ['name', 'sAMAccountName', 'dNSHostName', 'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime',
+                 'userAccountControl']
+            )
+            
+            # Also get Managed Service Accounts (MSAs)
+            msa_entries = self.search(
+                self.base_dn,
+                "(objectClass=msDS-ManagedServiceAccount)",
+                ['name', 'sAMAccountName', 'dNSHostName', 'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime',
+                 'userAccountControl']
+            )
+
+            # Combine all result sets
+            all_entries = list(entries) if entries else []
+            if service_entries:
+                all_entries.extend(service_entries)
+            if msa_entries:
+                all_entries.extend(msa_entries)
+
+            for entry in all_entries:
                 uac = get_attr(entry, 'userAccountControl', 0)
                 uac_parsed = parse_uac(uac)
 
@@ -1635,14 +2495,22 @@ class PyADRecon:
 
                 # Only include if we can read the password or it's set
                 password_readable = bool(laps_pwd)
+                password_stored = bool(laps_exp_int)  # If expiration time is set, password is stored
+
+                # For service accounts, use sAMAccountName (without $), otherwise use dNSHostName
+                hostname = get_attr(entry, 'dNSHostName', '')
+                if not hostname:
+                    # Service account - use sAMAccountName without the $ suffix
+                    sam = get_attr(entry, 'sAMAccountName', '')
+                    hostname = sam.rstrip('$') if sam else get_attr(entry, 'name', '')
 
                 results.append({
-                    "Computer Name": get_attr(entry, 'name', ''),
-                    "DNSHostName": get_attr(entry, 'dNSHostName', ''),
+                    "Hostname": hostname,
                     "Enabled": uac_parsed.get('Enabled', ''),
-                    "LAPS Password": laps_pwd if laps_pwd else "(Not Readable)",
-                    "Password Expiration": str(laps_exp_dt) if laps_exp_dt else "",
-                    "Password Readable": password_readable,
+                    "Stored": password_stored,
+                    "Readable": password_readable,
+                    "Password": laps_pwd if laps_pwd else "",
+                    "Expiration": str(laps_exp_dt) if laps_exp_dt else "",
                 })
 
         except Exception as e:
@@ -1677,7 +2545,7 @@ class PyADRecon:
                     "Recovery Password": get_attr(entry, 'msFVE-RecoveryPassword', ''),
                     "Recovery GUID": get_attr(entry, 'msFVE-RecoveryGuid', ''),
                     "Volume GUID": get_attr(entry, 'msFVE-VolumeGuid', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
                 })
 
         except Exception as e:
@@ -1685,48 +2553,6 @@ class PyADRecon:
 
         self.results['BitLocker'] = results
         logger.info(f"    Found {len(results)} BitLocker recovery keys")
-        return results
-
-    def collect_kerberoast(self) -> List[Dict]:
-        """Collect Kerberoastable accounts and request TGS tickets."""
-        logger.info("[-] Collecting Kerberoast - Requesting TGS tickets...")
-        results = []
-
-        if not IMPACKET_AVAILABLE:
-            logger.warning("[*] impacket not available - Kerberoast disabled")
-            return results
-
-        try:
-            # Get users with SPNs (excluding computers)
-            filter_str = "(&(objectCategory=person)(objectClass=user)(servicePrincipalName=*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
-
-            entries = self.search(
-                self.base_dn,
-                filter_str,
-                ['sAMAccountName', 'servicePrincipalName', 'distinguishedName']
-            )
-
-            for entry in entries:
-                spns = get_attr_list(entry, 'servicePrincipalName')
-                username = get_attr(entry, 'sAMAccountName', '')
-                user_domain = dn_to_fqdn(str(get_attr(entry, 'distinguishedName', '')))
-
-                for spn in spns:
-                    # Note: Getting actual TGS tickets requires domain membership or valid TGT
-                    # This is a placeholder - actual implementation would use impacket's GetUserSPNs
-                    results.append({
-                        "Username": username,
-                        "ServicePrincipalName": str(spn),
-                        "Domain": user_domain,
-                        "John": f"$krb5tgs${spn}:<hash_would_be_here>",
-                        "Hashcat": f"$krb5tgs$23$*{username}${user_domain}${spn}*$<hash>",
-                    })
-
-        except Exception as e:
-            logger.warning(f"Error collecting Kerberoast: {e}")
-
-        self.results['Kerberoast'] = results
-        logger.info(f"    Found {len(results)} Kerberoastable accounts")
         return results
 
     def collect_schema_history(self) -> List[Dict]:
@@ -1749,8 +2575,8 @@ class PyADRecon:
                 results.append({
                     "ObjectClass": obj_class,
                     "Name": get_attr(entry, 'name', ''),
-                    "whenCreated": str(get_attr(entry, 'whenCreated', '')),
-                    "whenChanged": str(get_attr(entry, 'whenChanged', '')),
+                    "whenCreated": format_datetime(get_attr(entry, 'whenCreated')),
+                    "whenChanged": format_datetime(get_attr(entry, 'whenChanged')),
                     "DistinguishedName": get_attr(entry, 'distinguishedName', ''),
                 })
 
@@ -1761,9 +2587,56 @@ class PyADRecon:
         logger.info(f"    Found {len(results)} schema objects")
         return results
 
+    def collect_about(self) -> List[Dict]:
+        """Collect metadata about the PyADRecon run."""
+        logger.info("[-] Collecting About PyADRecon...")
+        results = []
+
+        try:
+            # Calculate execution time
+            end_time = datetime.now()
+            duration = end_time - self.start_time
+            duration_mins = duration.total_seconds() / 60
+
+            # Get computer name where script is running
+            import platform
+            local_computer = platform.node()
+            
+            # Try to determine computer type by searching AD
+            computer_type = "Non-Domain System"
+            try:
+                # Try to find the computer in AD
+                comp_entries = self.search(
+                    self.base_dn,
+                    f"(&(objectCategory=computer)(dNSHostName={local_computer}*))",
+                    ['dNSHostName', 'operatingSystem']
+                )
+                if comp_entries:
+                    os_name = get_attr(comp_entries[0], 'operatingSystem', '')
+                    if 'Server' in os_name:
+                        computer_type = "Domain Member Server"
+                    else:
+                        computer_type = "Domain Member Workstation"
+            except:
+                pass
+
+            results.append({"Category": "PyADRecon Version", "Value": VERSION})
+            results.append({"Category": "Date", "Value": self.start_time.strftime("%m.%d.%Y %H:%M")})
+            results.append({"Category": "GitHub Repository", "Value": "github.com/l4rm4nd/PyADRecon"})
+            results.append({"Category": "Executed By", "Value": self.config.username if self.config.username else "Current User"})
+            results.append({"Category": "Executed From", "Value": f"{local_computer} ({computer_type})"})
+            results.append({"Category": "Execution Time", "Value": f"{duration_mins:.2f} minutes"})
+            results.append({"Category": "Target Domain", "Value": dn_to_fqdn(self.base_dn)})
+
+        except Exception as e:
+            logger.warning(f"Error collecting about info: {e}")
+
+        self.results['AboutPyADRecon'] = results
+        logger.info(f"    Found {len(results)} metadata items")
+        return results
+
     def run(self):
         """Run the AD reconnaissance."""
-        print(BANNER)
         logger.info(f"Starting PyADRecon at {self.start_time}")
         logger.info(f"Target: {self.config.domain_controller}")
         logger.info(f"Authentication: {self.config.auth_method.upper()}")
@@ -1844,8 +2717,8 @@ class PyADRecon:
         if self.config.collect_bitlocker:
             self.collect_bitlocker()
 
-        if self.config.collect_kerberoast:
-            self.collect_kerberoast()
+        # Collect metadata about this run (always collect)
+        self.collect_about()
 
         # Calculate execution time
         end_time = datetime.now()
@@ -1923,6 +2796,10 @@ class PyADRecon:
             # Define styles for headers
             header_font = Font(bold=True, color="FFFFFF")
             header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
+            left_alignment = Alignment(horizontal='left', vertical='top')
+
+            # Track column widths for auto-sizing later
+            column_widths = {}
 
             # Create Table of Contents sheet first (small, use regular mode)
             toc_data = [
@@ -1932,19 +2809,61 @@ class PyADRecon:
                 [""],
                 ["Sheet Name", "Record Count"],
             ]
-            for name in self.results.keys():
-                if self.results[name]:
-                    toc_data.append([name, len(self.results[name])])
+            
+            # Define sheet order to match ADRecon
+            SHEET_ORDER = [
+                'Users', 'UserSPNs', 'GroupMembers', 'Groups', 'OUs', 'Computers',
+                'ComputerSPNs', 'LAPS', 'DNSZones', 'DNSRecords', 'gPLinks', 'GPOs',
+                'DomainControllers', 'PasswordPolicy', 'FineGrainedPasswordPolicy',
+                'SchemaHistory', 'Sites', 'Domain', 'Forest', 'AboutPyADRecon'
+            ]
+            
+            # Friendly sheet names mapping
+            SHEET_NAME_MAPPING = {
+                'AboutPyADRecon': 'About PyADRecon'
+            }
+            
+            for name in SHEET_ORDER:
+                if name in self.results and self.results[name]:
+                    friendly_name = SHEET_NAME_MAPPING.get(name, name)
+                    toc_data.append([friendly_name, len(self.results[name])])
 
             toc_ws = wb.create_sheet("Table of Contents")
-            for row in toc_data:
+            
+            # Write headers
+            for row in toc_data[:5]:  # First 5 rows (title, date, domain, blank, headers)
                 toc_ws.append(row)
-
+            
+            # Write sheet names with hyperlinks (in write_only mode, we need to use WriteOnlyCell)
+            for row_data in toc_data[5:]:
+                sheet_name = row_data[0]
+                record_count = row_data[1]
+                
+                # Create cell with hyperlink
+                name_cell = WriteOnlyCell(toc_ws, value=sheet_name)
+                name_cell.hyperlink = f"#'{sheet_name}'!A1"
+                name_cell.font = Font(color="0563C1", underline="single")
+                
+                count_cell = WriteOnlyCell(toc_ws, value=record_count)
+                
+                toc_ws.append([name_cell, count_cell])
+            
+            # Order sheets according to SHEET_ORDER, then add any remaining
+            ordered_names = []
+            for sheet in SHEET_ORDER:
+                if sheet in self.results and self.results[sheet]:
+                    ordered_names.append(sheet)
+            # Add any remaining sheets not in the order
+            for name in self.results.keys():
+                if name not in ordered_names and self.results[name]:
+                    ordered_names.append(name)
+            
             # Process each result set
-            total_sheets = len([k for k, v in self.results.items() if v])
+            total_sheets = len(ordered_names)
             current_sheet = 0
 
-            for name, data in self.results.items():
+            for name in ordered_names:
+                data = self.results[name]
                 if not data:
                     continue
 
@@ -1952,9 +2871,26 @@ class PyADRecon:
                 record_count = len(data)
                 logger.info(f"    [{current_sheet}/{total_sheets}] Writing {name} ({record_count:,} records)...")
 
-                ws = wb.create_sheet(name[:31])  # Excel sheet name limit
+                # Sort data by first column alphabetically (case-insensitive)
+                if data and len(data) > 0:
+                    first_key = list(data[0].keys())[0]
+                    try:
+                        data = sorted(data, key=lambda x: str(x.get(first_key, '')).lower())
+                    except Exception as e:
+                        logger.debug(f"Could not sort {name} by {first_key}: {e}")
+
+                # Use friendly name if available, otherwise use original name
+                display_name = SHEET_NAME_MAPPING.get(name, name)
+                ws = wb.create_sheet(display_name[:31])  # Excel sheet name limit
+                sheet_name = display_name[:31]
 
                 headers = list(data[0].keys())
+
+                # Initialize column width tracking for this sheet
+                column_widths[sheet_name] = {}
+                for idx, header in enumerate(headers):
+                    # Start with header length
+                    column_widths[sheet_name][idx] = len(str(header))
 
                 # Write header row with styling
                 header_row = []
@@ -1962,14 +2898,17 @@ class PyADRecon:
                     cell = WriteOnlyCell(ws, value=header)
                     cell.font = header_font
                     cell.fill = header_fill
+                    cell.alignment = left_alignment
                     header_row.append(cell)
                 ws.append(header_row)
 
                 # Write data rows in batches for progress reporting
                 batch_size = 10000
+                max_sample_rows = 1000  # Sample first N rows for width calculation
+                
                 for i, row_data in enumerate(data):
                     row = []
-                    for header in headers:
+                    for col_idx, header in enumerate(headers):
                         value = row_data.get(header, '')
                         # Handle ldap3 Attribute objects
                         if hasattr(value, 'raw_values'):
@@ -1983,6 +2922,13 @@ class PyADRecon:
                             value = str(value)
                         elif not isinstance(value, (str, int, float, bool)):
                             value = str(value)
+                        
+                        # Track column width (sample first N rows to avoid performance hit)
+                        if i < max_sample_rows:
+                            val_len = len(str(value))
+                            if val_len > column_widths[sheet_name][col_idx]:
+                                column_widths[sheet_name][col_idx] = val_len
+                        
                         row.append(value)
                     ws.append(row)
 
@@ -1996,6 +2942,53 @@ class PyADRecon:
             logger.info(f"    Saving Excel file...")
             wb.save(filename)
 
+            # Reopen in edit mode to set column widths and filters (can't do this in write_only mode)
+            logger.info(f"    Auto-sizing columns and adding filters...")
+            from openpyxl import load_workbook
+            from openpyxl.utils import get_column_letter
+            
+            wb = load_workbook(filename)
+            
+            # Apply column widths, alignment, and filters to each sheet
+            for sheet_name, widths in column_widths.items():
+                if sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    
+                    # Set column widths
+                    for col_idx, width in widths.items():
+                        # Add some padding and cap at reasonable max
+                        # Excel column width units are weird, so we adjust
+                        adjusted_width = min(width + 2, 100)
+                        column_letter = get_column_letter(col_idx + 1)
+                        ws.column_dimensions[column_letter].width = adjusted_width
+                    
+                    # Apply left alignment to all cells
+                    for row in ws.iter_rows():
+                        for cell in row:
+                            cell.alignment = Alignment(horizontal='left', vertical='top')
+                    
+                    # Add auto-filter to header row
+                    if ws.max_row > 0 and ws.max_column > 0:
+                        ws.auto_filter.ref = ws.dimensions
+            
+            # Also auto-size Table of Contents
+            if "Table of Contents" in wb.sheetnames:
+                toc_ws = wb["Table of Contents"]
+                for column in toc_ws.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if cell.value:
+                                max_length = max(max_length, len(str(cell.value)))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 100)
+                    toc_ws.column_dimensions[column_letter].width = adjusted_width
+            
+            wb.save(filename)
+            wb.close()
+
             duration = datetime.now() - start_time
             logger.info(f"[+] Excel Report saved to: {filename} (took {duration})")
             return filename
@@ -2005,6 +2998,11 @@ class PyADRecon:
             import traceback
             traceback.print_exc()
             return None
+
+    def close(self):
+        """Close LDAP connection."""
+        if self.conn:
+            self.conn.unbind()            
 
 
 def generate_excel_from_csv(csv_dir: str, output_file: str = None):
@@ -2031,11 +3029,36 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         from openpyxl import Workbook
         from openpyxl.cell import WriteOnlyCell
 
+        # Define sheet order to match ADRecon
+        SHEET_ORDER = [
+            'Users', 'UserSPNs', 'GroupMembers', 'Groups', 'OUs', 'Computers',
+            'ComputerSPNs', 'LAPS', 'DNSZones', 'DNSRecords', 'gPLinks', 'GPOs',
+            'DomainControllers', 'PasswordPolicy', 'FineGrainedPasswordPolicy',
+            'SchemaHistory', 'Sites', 'Domain', 'Forest', 'AboutPyADRecon'
+        ]
+        
+        # Friendly sheet names mapping
+        SHEET_NAME_MAPPING = {
+            'AboutPyADRecon': 'About PyADRecon'
+        }
+
         # Find all CSV files
-        csv_files = sorted([f for f in os.listdir(csv_dir) if f.endswith('.csv')])
-        if not csv_files:
+        all_csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
+        if not all_csv_files:
             logger.error(f"[!] No CSV files found in: {csv_dir}")
             return None
+
+        # Order CSV files according to SHEET_ORDER
+        csv_files = []
+        for sheet in SHEET_ORDER:
+            csv_name = sheet + '.csv'
+            if csv_name in all_csv_files:
+                csv_files.append(csv_name)
+        
+        # Add any remaining CSV files not in the order
+        for csv_file in sorted(all_csv_files):
+            if csv_file not in csv_files:
+                csv_files.append(csv_file)
 
         logger.info(f"    Found {len(csv_files)} CSV files")
 
@@ -2045,6 +3068,7 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         # Define styles
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="0066CC", end_color="0066CC", fill_type="solid")
+        left_alignment = Alignment(horizontal='left', vertical='top')
 
         # Build TOC data
         toc_data = [
@@ -2073,7 +3097,10 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         # Process each CSV file
         total_files = len(csv_files)
         for idx, csv_file in enumerate(csv_files, 1):
-            sheet_name = csv_file.replace('.csv', '')[:31]  # Excel limit
+            original_name = csv_file.replace('.csv', '')
+            # Use friendly name if available, otherwise use original name
+            display_name = SHEET_NAME_MAPPING.get(original_name, original_name)
+            sheet_name = display_name[:31]  # Excel limit
             record_count = file_counts[csv_file]
 
             logger.info(f"    [{idx}/{total_files}] Processing {csv_file} ({record_count:,} records)...")
@@ -2092,14 +3119,14 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
                         cell = WriteOnlyCell(ws, value=header)
                         cell.font = header_font
                         cell.fill = header_fill
+                        cell.alignment = left_alignment
                         header_row.append(cell)
                     ws.append(header_row)
                 except StopIteration:
                     continue  # Empty file
 
-                # Write data rows
-                batch_size = 10000
-                row_num = 0
+                # Read all data rows into memory for sorting
+                all_rows = []
                 for row in reader:
                     # Convert empty strings and handle encoding
                     clean_row = []
@@ -2115,8 +3142,18 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
                                     clean_row.append(int(val))
                             except ValueError:
                                 clean_row.append(val)
+                    all_rows.append(clean_row)
+                
+                # Sort by first column (case-insensitive string comparison)
+                try:
+                    all_rows.sort(key=lambda x: str(x[0]).lower() if len(x) > 0 else '')
+                except Exception as e:
+                    logger.debug(f"Could not sort {csv_file}: {e}")
+                
+                # Write sorted data rows
+                batch_size = 10000
+                for row_num, clean_row in enumerate(all_rows, 1):
                     ws.append(clean_row)
-                    row_num += 1
 
                     # Progress for large files
                     if record_count > batch_size and row_num % batch_size == 0:
@@ -2136,6 +3173,26 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
 
         logger.info(f"    Saving Excel file...")
         wb.save(filename)
+        
+        # Reopen to add filters (can't do this in write_only mode)
+        logger.info(f"    Adding filters to all sheets...")
+        from openpyxl import load_workbook
+        
+        wb = load_workbook(filename)
+        for sheet_name in wb.sheetnames:
+            if sheet_name != "Table of Contents":  # Skip TOC
+                ws = wb[sheet_name]
+                
+                # Apply left alignment to all cells
+                for row in ws.iter_rows():
+                    for cell in row:
+                        cell.alignment = Alignment(horizontal='left', vertical='top')
+                
+                if ws.max_row > 0 and ws.max_column > 0:
+                    ws.auto_filter.ref = ws.dimensions
+        
+        wb.save(filename)
+        wb.close()
 
         duration = datetime.now() - start_time
         logger.info(f"[+] Excel Report saved to: {filename}")
@@ -2147,12 +3204,6 @@ def generate_excel_from_csv(csv_dir: str, output_file: str = None):
         import traceback
         traceback.print_exc()
         return None
-
-    def close(self):
-        """Close LDAP connection."""
-        if self.conn:
-            self.conn.unbind()
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2195,7 +3246,7 @@ Examples:
     parser.add_argument('--auth', choices=['ntlm', 'kerberos'], default='ntlm',
                        help='Authentication method (default: ntlm)')
     parser.add_argument('--ssl', action='store_true',
-                       help='Use SSL/TLS (LDAPS)')
+                       help='Force SSL/TLS (LDAPS). No LDAP fallback allowed.')
     parser.add_argument('--port', type=int, default=389,
                        help='LDAP port (default: 389, use 636 for LDAPS)')
     parser.add_argument('-o', '--output', default='',
@@ -2206,12 +3257,12 @@ Examples:
                        help='Number of threads (default: 10)')
     parser.add_argument('--dormant-days', type=int, default=90,
                        help='Days for dormant account threshold (default: 90)')
-    parser.add_argument('--password-age', type=int, default=30,
-                       help='Days for password age threshold (default: 30)')
+    parser.add_argument('--password-age', type=int, default=180,
+                       help='Days for password age threshold (default: 180)')
     parser.add_argument('--only-enabled', action='store_true',
                        help='Only collect enabled objects')
     parser.add_argument('--collect', default='default',
-                       help='Comma-separated modules to collect (default: all except kerberoast,acls)')
+                       help='Comma-separated modules to collect (default: all)')
     parser.add_argument('--no-excel', action='store_true',
                        help='Skip Excel report generation')
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -2251,6 +3302,10 @@ Examples:
         print("[!] ldap3 library required: pip install ldap3")
         print("[!] Install all dependencies: pip install -r requirements.txt")
         sys.exit(1)
+
+    # Display banner
+    print(BANNER)
+    sys.stdout.flush()
 
     # Parse collection modules
     collect_modules = args.collect.lower().split(',')
@@ -2298,8 +3353,6 @@ Examples:
         config.collect_computer_spns = 'computerspns' in collect_modules
         config.collect_laps = 'laps' in collect_modules
         config.collect_bitlocker = 'bitlocker' in collect_modules
-        config.collect_kerberoast = 'kerberoast' in collect_modules
-        config.collect_acls = 'acls' in collect_modules
 
     # Create output directory
     if args.output:
